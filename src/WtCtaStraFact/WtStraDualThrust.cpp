@@ -193,5 +193,6 @@ void WtStraDualThrust::on_init(ICtaStraCtx* ctx)
 
 void WtStraDualThrust::on_tick(ICtaStraCtx* ctx, const char* stdCode, WTSTickData* newTick)
 {
+	ctx->stra_log_info(fmt::format("newTick price {} open {}", newTick->price(), newTick->open()).c_str());
 	//没有什么要处理
 }

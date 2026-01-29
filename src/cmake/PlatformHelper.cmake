@@ -22,23 +22,20 @@ ENDMACRO()
 # CTP 6.6.9 darwin static library support
 # The darwin .a libs require OpenSSL and stub implementations for internal symbols
 IF(APPLE)
-    EXECUTE_PROCESS(COMMAND brew --prefix openssl@3 OUTPUT_VARIABLE OPENSSL_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE)
     SET(CTP669_DIR ${CMAKE_CURRENT_SOURCE_DIR}/API/CTP6.6.9/darwin)
-    SET(CTP669_STUBS_SRC ${CTP669_DIR}/ctp_stubs.cpp)
 
     # Build stubs as a static library
-    ADD_LIBRARY(ctp_stubs STATIC ${CTP669_STUBS_SRC})
 
     SET(CTP669_TRADER_LIBS
         ${CTP669_DIR}/libthosttraderapi_se.a
-        ctp_stubs
-        ${OPENSSL_ROOT}/lib/libssl.a
-        ${OPENSSL_ROOT}/lib/libcrypto.a
+        ${CTP669_DIR}/libs/libssl.a
+        ${CTP669_DIR}/libs/libcrypto.a
+        ${CTP669_DIR}/libs/comunicationkeylib.a
     )
     SET(CTP669_MD_LIBS
         ${CTP669_DIR}/libthostmduserapi_se.a
-        ctp_stubs
-        ${OPENSSL_ROOT}/lib/libssl.a
-        ${OPENSSL_ROOT}/lib/libcrypto.a
+        ${CTP669_DIR}/libs/libssl.a
+        ${CTP669_DIR}/libs/libcrypto.a
+        ${CTP669_DIR}/libs/comunicationkeylib.a
     )
 ENDIF()
