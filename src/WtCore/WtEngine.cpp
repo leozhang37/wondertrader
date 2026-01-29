@@ -95,7 +95,7 @@ std::string WtEngine::get_rawcode(const char* stdCode)
 	if (cInfo.hasRule())
 	{
 		std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-		return CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+		return CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	}
 
 	return "";
@@ -800,7 +800,7 @@ void WtEngine::sub_tick(uint32_t sid, const char* stdCode)
 
 		CodeHelper::CodeInfo cInfo = CodeHelper::extractStdCode(stdCode, _hot_mgr);
 		std::string rawCode = _hot_mgr->getCustomRawCode(ruleTag, cInfo.stdCommID(), _cur_tdate);
-		std::string stdRawCode = CodeHelper::rawMonthCodeToStdCode(rawCode.c_str(), cInfo._exchg);
+		std::string stdRawCode = CodeHelper::rawMonthCodeToStdCode(rawCode.c_str(), cInfo._exchg, false, _cur_tdate);
 	}
 	//if (CodeHelper::isStdFutHotCode(stdCode))
 	//{

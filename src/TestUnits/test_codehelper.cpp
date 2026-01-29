@@ -18,6 +18,15 @@ TEST(test_codehelper, test_raw_to_std)
 	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("IF2112", "CFFEX"), "CFFEX.IF.2112");
 	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("MA2112", "CZCE"), "CZCE.MA.2112");
 	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("v2112", "DCE"), "DCE.v.2112");
+
+	// CZCE 3位码动态推断十位（基于当前系统年份）
+	// 当前年份2026: 个位6, 十位2
+	// SA605: 个位6 >= 6 → 十位2 → SA2605
+	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("SA605", "CZCE"), "CZCE.SA.2605");
+	// SA505: 个位5 < 6 → 十位3 → SA3505
+	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("SA505", "CZCE"), "CZCE.SA.3505");
+	// 4位码不受影响
+	EXPECT_EQ(CodeHelper::rawMonthCodeToStdCode("SA2605", "CZCE"), "CZCE.SA.2605");
 	
 	EXPECT_TRUE(CodeHelper::isMonthlyCode("MA221"));
 	EXPECT_TRUE(CodeHelper::isMonthlyCode("rb2001"));

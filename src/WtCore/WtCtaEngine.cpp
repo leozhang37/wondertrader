@@ -166,7 +166,7 @@ void WtCtaEngine::on_init()
 				if(strlen(cInfo._ruletag) > 0)
 				{
 					std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-					realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+					realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 				}
 
 				for(auto& execid : exec_ids)
@@ -289,7 +289,7 @@ void WtCtaEngine::on_schedule(uint32_t curDate, uint32_t curTime)
 					if (strlen(cInfo._ruletag) > 0)
 					{
 						std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-						realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+						realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 					}
 
 					double& vol = target_pos[realCode];
@@ -330,7 +330,7 @@ void WtCtaEngine::on_schedule(uint32_t curDate, uint32_t curTime)
 					if (strlen(cInfo._ruletag) > 0)
 					{
 						std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-						realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+						realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 					}
 
 					double& vol = target_pos[realCode];
@@ -434,7 +434,7 @@ void WtCtaEngine::handle_pos_change(const char* straName, const char* stdCode, d
 	if (strlen(cInfo._ruletag) > 0)
 	{
 		std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-		realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+		realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	}
 
 	/*

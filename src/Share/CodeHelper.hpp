@@ -10,6 +10,7 @@
 #pragma once
 #include "fmtlib.h"
 #include "StrUtil.hpp"
+#include "TimeUtils.hpp"
 #include "../Includes/WTSTypes.h"
 #include "../Includes/IHotMgr.h"
 
@@ -283,7 +284,7 @@ public:
 	 *	如ag1912转成全码
 	 *	这个不会有永续合约的代码传到这里来，如果有的话就是调用的地方有Bug!
 	 */
-	static inline std::string rawMonthCodeToStdCode(const char* code, const char* exchg, bool isComm = false)
+	static inline std::string rawMonthCodeToStdCode(const char* code, const char* exchg, bool isComm = false, uint32_t curDate = 0)
 	{
 		thread_local static char buffer[64] = { 0 };
 		std::size_t len = 0;
@@ -322,10 +323,19 @@ public:
 			}
 			else
 			{
-				if (s[0] > '5')
-					buffer[len] = '1';
+				// 动态推断CZCE十位数字，与CTPLoader::fillCzceCode逻辑一致
+				// 合约年份个位 >= 当前年份个位 → 当前十年
+				// 合约年份个位 <  当前年份个位 → 下一个十年
+				if (curDate == 0)
+					curDate = TimeUtils::getCurDate();
+				uint32_t curYear = curDate / 10000;
+				uint32_t curDecade = (curYear % 100) / 10;
+				uint32_t curUnit = curYear % 10;
+				uint32_t cUnit = s[0] - '0';
+				if (cUnit >= curUnit)
+					buffer[len] = '0' + curDecade;
 				else
-					buffer[len] = '2';
+					buffer[len] = '0' + (curDecade + 1);
 				len += 1;
 				wt_strcpy(buffer + len, s, 3);
 				len += 3;

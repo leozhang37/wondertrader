@@ -2902,7 +2902,7 @@ std::string HisDataReplayer::get_rawcode(const char* stdCode)
 	if(cInfo.hasRule())
 	{
 		std::string code = _hot_mgr.getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-		return CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+		return CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	}
 
 	return "";

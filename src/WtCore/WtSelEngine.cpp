@@ -423,19 +423,19 @@ void WtSelEngine::handle_pos_change(const char* straName, const char* stdCode, d
 	if (strlen(cInfo._ruletag) > 0)
 	{
 		std::string code = _hot_mgr->getCustomRawCode(cInfo._ruletag, cInfo.stdCommID(), _cur_tdate);
-		realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+		realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	}
 	//else if (CodeHelper::isStdFutHotCode(stdCode))
 	//{
 	//	CodeHelper::CodeInfo cInfo = CodeHelper::extractStdCode(stdCode);
 	//	std::string code = _hot_mgr->getRawCode(cInfo._exchg, cInfo._product, _cur_tdate);
-	//	realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+	//	realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	//}
 	//else if (CodeHelper::isStdFut2ndCode(stdCode))
 	//{
 	//	CodeHelper::CodeInfo cInfo = CodeHelper::extractStdCode(stdCode);
 	//	std::string code = _hot_mgr->getSecondRawCode(cInfo._exchg, cInfo._product, _cur_tdate);
-	//	realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg);
+	//	realCode = CodeHelper::rawMonthCodeToStdCode(code.c_str(), cInfo._exchg, false, _cur_tdate);
 	//}
 
 	{
