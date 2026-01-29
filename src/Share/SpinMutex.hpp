@@ -37,8 +37,12 @@ public:
 			{
 #ifdef _MSC_VER
 				_mm_pause();
-#else
+#elif defined(__x86_64__) || defined(__i386__)
 				__builtin_ia32_pause();
+#elif defined(__aarch64__)
+				asm volatile("yield");
+#else
+				// fallback: no pause instruction
 #endif
 			}
 		}

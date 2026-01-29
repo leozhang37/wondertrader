@@ -149,7 +149,7 @@ void CTraderSpi::ReqUserLogin()
 	strcpy(req.BrokerID, BROKER_ID.c_str());
 	strcpy(req.UserID, INVESTOR_ID.c_str());
 	strcpy(req.Password, PASSWORD.c_str());
-	int iResult = pUserApi->ReqUserLogin(&req, ++iRequestID);
+	int iResult = pUserApi->ReqUserLogin(&req, ++iRequestID, 0, {});
 	std::cerr << "--->>> Requesting user login: " << ((iResult == 0) ? "succeed" : "failed") << std::endl;
 }
 

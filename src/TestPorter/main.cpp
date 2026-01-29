@@ -84,11 +84,7 @@ void PORTER_FLAG on_transaction(CtxHandler cHandle, const char* stdCode, WTSTran
 
 void test_porter()
 {
-#ifdef _WIN32
-	DLLHelper::load_library("WtPorter.dll");
-#else
-	DLLHelper::load_library("libWtPorter.so");
-#endif
+	DLLHelper::load_library(DLLHelper::wrap_module("WtPorter").c_str());
 	init_porter("logcfg.yaml", true, "./generated");
 
 	reg_hft_factories("./hft");

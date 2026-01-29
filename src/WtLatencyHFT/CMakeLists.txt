@@ -33,6 +33,7 @@ ELSE(GNUCC)
 		boost_thread
 		boost_filesystem
         stdc++fs)
+	FIX_PLATFORM_LIBS(LIBS)
 	IF(WIN32)
 		LIST(APPEND LIBS
 			ws2_32 iconv)
@@ -44,7 +45,6 @@ TARGET_LINK_LIBRARIES(WtLatencyHFT ${LIBS})
 
 IF (MSVC)
 ELSE (GNUCC)
-	SET_TARGET_PROPERTIES(WtLatencyHFT PROPERTIES
-        LINK_FLAGS_RELEASE -s)
+	SET_STRIP_PROPS(WtLatencyHFT)
 ENDIF ()
 

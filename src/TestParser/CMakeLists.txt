@@ -22,6 +22,7 @@ ELSE(GNUCC)
 		dl
         pthread
 		stdc++fs)
+	FIX_PLATFORM_LIBS(LIBS)
     IF(WIN32)
 		LIST(APPEND LIBS
 			iconv)
@@ -36,6 +37,5 @@ TARGET_LINK_LIBRARIES(TestParser ${LIBS})
 
 IF (MSVC)
 ELSE (GNUCC)
-	SET_TARGET_PROPERTIES(TestParser PROPERTIES
-        LINK_FLAGS_RELEASE -s)
+	SET_STRIP_PROPS(TestParser)
 ENDIF ()

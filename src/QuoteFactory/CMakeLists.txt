@@ -32,6 +32,7 @@ ELSE(GNUCC)
         pthread
 		stdc++fs
 		)
+	FIX_PLATFORM_LIBS(LIBS)
 	if(WIN32)
 		LIST(APPEND LIBS
 			ws2_32 iconv)
@@ -44,11 +45,17 @@ TARGET_LINK_LIBRARIES(QuoteFactory ${LIBS})
 
 IF (MSVC)
 ELSE (GNUCC)
-	SET_TARGET_PROPERTIES(QuoteFactory PROPERTIES
-        LINK_FLAGS_RELEASE -s)
+	SET_STRIP_PROPS(QuoteFactory)
 ENDIF ()
 
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/parsers/)
+add_custom_command(TARGET QuoteFactory POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E
+	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}WtDataStorage${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/
+
+	COMMENT "depends modules copied")
+
+IF(NOT APPLE)
 add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/
@@ -62,9 +69,7 @@ add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTPMini${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/
 
-	COMMAND ${CMAKE_COMMAND} -E
-	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}WtDataStorage${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/
-
-	COMMENT "depends modules copied")
+	COMMENT "SDK depends modules copied")
+ENDIF()
 
 

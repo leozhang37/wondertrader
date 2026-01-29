@@ -4,6 +4,10 @@
 #include <Psapi.h>
 #else
 #include <unistd.h>
+#ifdef __APPLE__
+#include <signal.h>
+#include <errno.h>
+#endif
 #endif
 
 #include "fmtlib.h"
@@ -27,8 +31,13 @@ public:
 		}
 
 		return false;
+#elif defined(__APPLE__)
+		// macOS: use kill(pid, 0) to check if process exists
+		if (kill(pid, 0) == 0)
+			return true;
+		return (errno == EPERM);
 #else
-		//linux下在只需要检查/proc/[PID]是否存在即可
+		// Linux: check if /proc/[PID] exists
 		const char* path = fmtutil::format("/proc/{}", pid);
 		return access(path, 0) == 0;
 #endif

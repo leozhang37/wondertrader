@@ -4,11 +4,7 @@
 
 void test_exec()
 {
-#ifdef _WIN32
-	DLLHelper::load_library("WtExecMon.dll");
-#else
-	DLLHelper::load_library("libWtExecMon.so");
-#endif
+	DLLHelper::load_library(DLLHelper::wrap_module("WtExecMon").c_str());
 
 	init_exec("logcfgexec.yaml");
 

@@ -1,6 +1,6 @@
 ﻿#pragma once
 //v6.3.15
-#include "../API/CTP6.3.15/ThostFtdcTraderApi.h"
+#include "../API/CTP6.6.9/ThostFtdcTraderApi.h"
 #include "../Share/StdUtils.hpp"
 #include "../Share/SpinMutex.hpp"
 #include "../Includes/LoaderDef.hpp"

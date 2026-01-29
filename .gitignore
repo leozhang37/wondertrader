@@ -1,2 +1,5 @@
 dist/*
 .xmake
+build/*
+src/build_macos/*
+.idea/*

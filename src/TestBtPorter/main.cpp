@@ -75,11 +75,7 @@ bool on_load_his_bars(const char* stdCode, const char* period)
 
 void run_bt()
 {
-#ifdef _WIN32
-	DLLHelper::load_library("WtBtPorter.dll");
-#else
-	DLLHelper::load_library("libWtBtPorter.so");
-#endif
+	DLLHelper::load_library(DLLHelper::wrap_module("WtBtPorter").c_str());
 	register_cta_callbacks(on_init, on_tick, on_calc, on_bar, on_session_event, on_calc_done);
 
 	//register_ext_data_loader(on_load_his_bars, NULL, false);

@@ -249,6 +249,9 @@ bool TraderCTP::init(WTSVariant* params)
 		m_strFlowDir = "CTPTDFlow";
 
 	m_strFlowDir = StrUtil::standardisePath(m_strFlowDir);
+#ifdef __APPLE__
+    m_funcCreator = CThostFtdcTraderApi::CreateFtdcTraderApi;
+#else	
 
 	std::string module = params->getCString("ctpmodule");
 	if (module.empty())
@@ -267,7 +270,7 @@ bool TraderCTP::init(WTSVariant* params)
 	const char* creatorName = "_ZN19CThostFtdcTraderApi19CreateFtdcTraderApiEPKc";
 #endif
 	m_funcCreator = (CTPCreator)DLLHelper::get_symbol(m_hInstCTP, creatorName);
-
+#endif
 	m_bQuickStart = params->getBoolean("quick");
 
 	return true;
@@ -432,7 +435,7 @@ int TraderCTP::doLogin()
 	wt_strcpy(req.UserID, m_strUser.c_str(), m_strUser.size());
 	wt_strcpy(req.Password, m_strPass.c_str(), m_strPass.size());
 	wt_strcpy(req.UserProductInfo, m_strProdInfo.c_str(), m_strProdInfo.size());
-	int iResult = m_pUserAPI->ReqUserLogin(&req, genRequestID());
+	int iResult = m_pUserAPI->ReqUserLogin(&req, genRequestID(), 0, {});
 	if (iResult != 0)
 	{
 		write_log(m_sink, LL_ERROR, "[TraderCTP] Sending login request failed: {}", iResult);

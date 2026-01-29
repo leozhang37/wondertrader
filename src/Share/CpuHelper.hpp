@@ -22,6 +22,14 @@ public:
 		DWORD_PTR mask = SetThreadAffinityMask(hThread, (DWORD_PTR)(1 << i));
 		return (mask != 0);
 	}
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <unistd.h>
+	static bool bind_core(uint32_t i)
+	{
+		// macOS does not support pthread_setaffinity_np
+		return false;
+	}
 #else
 #include <pthread.h>
 #include <sched.h>
