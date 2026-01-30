@@ -1,8 +1,11 @@
 ﻿#include <string>
 #include <map>
 #include <set>
-//v6.3.15
+#ifdef __APPLE__
 #include "../API/CTP6.6.9/ThostFtdcTraderApi.h"
+#else
+#include "../API/CTP6.3.15/ThostFtdcTraderApi.h"
+#endif
 #include "TraderSpi.h"
 
 #include "../Share/IniHelper.hpp"
