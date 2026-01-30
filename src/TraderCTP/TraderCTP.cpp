@@ -435,7 +435,11 @@ int TraderCTP::doLogin()
 	wt_strcpy(req.UserID, m_strUser.c_str(), m_strUser.size());
 	wt_strcpy(req.Password, m_strPass.c_str(), m_strPass.size());
 	wt_strcpy(req.UserProductInfo, m_strProdInfo.c_str(), m_strProdInfo.size());
+#ifdef __APPLE__
 	int iResult = m_pUserAPI->ReqUserLogin(&req, genRequestID(), 0, {});
+#else
+	int iResult = m_pUserAPI->ReqUserLogin(&req, genRequestID());
+#endif
 	if (iResult != 0)
 	{
 		write_log(m_sink, LL_ERROR, "[TraderCTP] Sending login request failed: {}", iResult);
