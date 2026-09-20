@@ -15,6 +15,7 @@
  */
 #pragma once
 #include <string>
+#include <map>
 
 //DataDefine.h 只有块结构体的定义，没有实现代码，直接include不涉及ODR
 #include "../WtDataStorage/DataDefine.h"
@@ -36,17 +37,38 @@ namespace storage_loader
 		return StrUtil::standardisePath(std::string(d));
 	}
 
-	inline DllHandle load()
+	inline DllHandle load(const char* module = "WtDataStorage")
 	{
-		static DllHandle s_handle = NULL;
-		if (s_handle != NULL)
-			return s_handle;
+		//同一个模块只加载一次
+		static std::map<std::string, DllHandle> s_handles;
+		auto it = s_handles.find(module);
+		if (it != s_handles.end())
+			return it->second;
 
-		std::string path = lib_dir() + DLLHelper::wrap_module("WtDataStorage");
-		s_handle = DLLHelper::load_library(path.c_str());
-		if (s_handle == NULL)
+		std::string path = lib_dir() + DLLHelper::wrap_module(module);
+		DllHandle h = DLLHelper::load_library(path.c_str());
+		if (h == NULL)
 			printf("[loader] failed to load %s\n", path.c_str());
-		return s_handle;
+		s_handles[module] = h;
+		return h;
+	}
+
+	//AD(LMDB)存储引擎
+	inline IDataWriter* make_ad_writer()
+	{
+		DllHandle h = load("WtDataStorageAD");
+		if (h == NULL) return NULL;
+		typedef IDataWriter* (*FuncCreateWriter)();
+		FuncCreateWriter f = (FuncCreateWriter)DLLHelper::get_symbol(h, "createWriter");
+		return (f != NULL) ? f() : NULL;
+	}
+
+	inline IDataReader* make_ad_reader()
+	{
+		DllHandle h = load("WtDataStorageAD");
+		if (h == NULL) return NULL;
+		FuncCreateDataReader f = (FuncCreateDataReader)DLLHelper::get_symbol(h, "createDataReader");
+		return (f != NULL) ? f() : NULL;
 	}
 
 	inline IDataWriter* make_writer()

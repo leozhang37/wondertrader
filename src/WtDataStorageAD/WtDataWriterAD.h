@@ -63,6 +63,9 @@ private:
 	RTBarCacheWrapper _m1_cache;
 	RTBarCacheWrapper _m5_cache;
 	RTBarCacheWrapper _d1_cache;
+	//秒线缓存
+	//By 秒K线支持 @ 2026.09.20
+	RTBarCacheWrapper _s5_cache;
 
 	typedef std::function<void()> TaskInfo;
 	std::queue<TaskInfo>	_tasks;
@@ -81,6 +84,16 @@ private:
 	bool			_disable_min5;
 	bool			_disable_day;
 
+	/*
+	 *	秒线开关采用"显式启用"，和 WtDataWriter 保持一致
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线体积约是min1的12倍，若沿用disable语义(缺省即开启)，
+	 *	老配置升级上来会在无感知的情况下数据量暴增
+	 */
+	bool			_enable_sec5;
+	//为空表示不限合约(仍需_enable_sec5为true)
+	wt_hashset<std::string>	_sec5_codes;
+
 	uint32_t		_tick_mapsize;
 	uint32_t		_kline_mapsize;
 
@@ -96,6 +109,7 @@ private:
 
 	WtLMDBMap	_exchg_m1_dbs;
 	WtLMDBMap	_exchg_m5_dbs;
+	WtLMDBMap	_exchg_s5_dbs;
 	WtLMDBMap	_exchg_d1_dbs;
 
 	//用exchg.code作为key，如BINANCE.BTCUSDT
@@ -119,6 +133,9 @@ private:
 	void pipeToM1Bars(WTSContractInfo* ct, const WTSBarStruct& bar);
 
 	void pipeToM5Bars(WTSContractInfo* ct, const WTSBarStruct& bar);
+
+	//By 秒K线支持 @ 2026.09.20
+	void pipeToSec5Bars(WTSContractInfo* ct, const WTSBarStruct& bar);
 
 	void pushTask(TaskInfo task);
 };
