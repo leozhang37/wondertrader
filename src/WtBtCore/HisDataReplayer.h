@@ -503,6 +503,18 @@ private:
 	uint32_t		_cur_date;
 	uint32_t		_cur_time;
 	uint32_t		_cur_secs;
+
+	/*
+	 *	秒精度的当前时刻(yyyyMMddHHmmss)
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	回测原本的时间轴是分钟精度：nextBarTime = date*10000 + HHMM。
+	 *	秒线的bar时间戳是 yyyyMMddHHmmss，两者量级差5个数量级，
+	 *	没法共用一个游标，所以这里单独维护一条秒精度的轴。
+	 *	主K线是分钟线时它跟着分钟走(秒位补0)，
+	 *	主K线是秒线时它才是真正的推进依据
+	 */
+	uint64_t		_sec_now_stamp;
 	uint32_t		_cur_tdate;
 	uint32_t		_closed_tdate;
 	uint32_t		_opened_tdate;

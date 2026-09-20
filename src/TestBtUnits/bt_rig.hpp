@@ -37,6 +37,15 @@ namespace bt_rig
 {
 	namespace bfs = boost::filesystem;
 
+	//HHMMSS 加秒
+	inline uint32_t advance_hms_local(uint32_t hms, uint32_t secs)
+	{
+		uint32_t h = hms / 10000, m = hms % 10000 / 100, s = hms % 100;
+		uint32_t total = h * 3600 + m * 60 + s + secs;
+		total %= 86400;
+		return (total / 3600) * 10000 + (total % 3600 / 60) * 100 + total % 60;
+	}
+
 	inline std::string lib_dir()
 	{
 		const char* d = getenv("WT_TEST_LIBDIR");
@@ -247,6 +256,72 @@ namespace bt_rig
 			_name = s->id();
 		}
 	};
+
+	/*
+	 *	造 sec5 历史K线
+	 *	时间戳用 yyyyMMddHHmmss(timeToSecBar)，和落盘格式一致
+	 */
+	inline uint32_t write_sec5_bars(const std::string& dir, const char* exchg, const char* code,
+		uint32_t startDate, uint32_t days)
+	{
+		std::string path = fmtutil::format("{}his/sec5/{}/", dir, exchg);
+		bfs::create_directories(path);
+
+		std::vector<WTSBarStruct> bars;
+
+		//两小节：9:00-10:15(4500秒) + 10:30-11:30(3600秒)，每5秒一根
+		uint32_t date = startDate;
+		double px = 1000.0;
+
+		for (uint32_t d = 0; d < days; d++)
+		{
+			for (uint32_t seg = 0; seg < 2; seg++)
+			{
+				uint32_t startHms = (seg == 0) ? 90000 : 103000;
+				uint32_t secs = (seg == 0) ? 4500 : 3600;
+
+				for (uint32_t s = 5; s <= secs; s += 5)
+				{
+					uint32_t hms = advance_hms_local(startHms, s);
+
+					uint32_t seed = d * 10000 + seg * 5000 + s;
+					double wave = ((seed * 1103515245u + 12345u) % 1000) / 100.0 - 5.0;
+					double trend = (d % 4 < 2) ? 0.05 : -0.05;
+					px += trend + wave * 0.1;
+					if (px < 100.0) px = 100.0;
+
+					WTSBarStruct b;
+					b.date = date;
+					b.time = TimeUtils::timeToSecBar(date, hms);
+					b.open = px - 0.5;
+					b.high = px + 1.0;
+					b.low = px - 1.0;
+					b.close = px;
+					b.vol = 10 + (seed % 20);
+					b.money = b.close * b.vol * 10;
+					b.hold = 10000;
+					b.add = 0;
+					bars.emplace_back(b);
+				}
+			}
+			date = TimeUtils::getNextDate(date);
+		}
+
+		BlockHeader hdr;
+		memset(&hdr, 0, sizeof(hdr));
+		strcpy(hdr._blk_flag, BLK_FLAG);
+		hdr._type = BT_HIS_Sec5;
+		hdr._version = BLOCK_VERSION_RAW_V2;
+
+		std::string file = fmtutil::format("{}{}.dsb", path, code);
+		BoostFile f;
+		f.create_new_file(file.c_str());
+		f.write_file(&hdr, sizeof(hdr));
+		f.write_file(bars.data(), sizeof(WTSBarStruct) * bars.size());
+		f.close_file();
+
+		return (uint32_t)bars.size();
+	}
 
 	//把输出目录里的csv读出来，用于逐字节比对
 	inline std::string read_output(const std::string& outDir, const char* straName, const char* fname)
