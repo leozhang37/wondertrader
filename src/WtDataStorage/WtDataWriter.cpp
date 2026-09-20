@@ -89,6 +89,7 @@ WtDataWriter::WtDataWriter()
 	, _disable_day(false)
 	, _disable_min1(false)
 	, _disable_min5(false)
+	, _enable_sec5(false)
 	, _disable_orddtl(false)
 	, _disable_ordque(false)
 	, _disable_trans(false)
@@ -145,6 +146,27 @@ bool WtDataWriter::init(WTSVariant* params, IDataWriterSink* sink)
 	_disable_min5 = params->getBoolean("disablemin5");
 	_disable_day = params->getBoolean("disableday");
 
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线默认关闭，必须显式打开，避免老配置升级后数据量无感知地涨12倍
+	 *	sec5_codes 是逗号分隔的合约全代码白名单(如 SHFE.rb2610)，留空表示不限合约
+	 */
+	_enable_sec5 = params->getBoolean("enablesec5");
+	if (_enable_sec5)
+	{
+		std::string codes = params->getCString("sec5_codes");
+		if (!codes.empty())
+		{
+			const StringVector& ay = StrUtil::split(codes, ",");
+			for (const std::string& code : ay)
+			{
+				std::string c = StrUtil::trim(code.c_str());
+				if (!c.empty())
+					_sec5_codes.insert(c);
+			}
+		}
+	}
+
 	_disable_trans = params->getBoolean("disabletrans");
 	_disable_ordque = params->getBoolean("disableordque");
 	_disable_orddtl = params->getBoolean("disableorddtl");
@@ -171,6 +193,14 @@ bool WtDataWriter::init(WTSVariant* params, IDataWriterSink* sink)
 		"disable_tick: {}, disable_min1: {}, disable_min5: {}, disable_day: {}, disable_trans: {}, disable_ordque: {}, disable_orders: {}, min_price_mode: {}", 
 		_base_dir, _save_tick_log, _async_proc, _log_group_size, _disable_his, _disable_tick, 
 		_disable_min1, _disable_min5, _disable_day, _disable_trans, _disable_ordque, _disable_orddtl, _min_price_mode);
+
+	if (_enable_sec5)
+	{
+		if (_sec5_codes.empty())
+			pipe_writer_log(sink, LL_WARN, "sec5 bars enabled for ALL contracts, expect roughly 12x the volume of min1 bars");
+		else
+			pipe_writer_log(sink, LL_INFO, "sec5 bars enabled for {} contract(s)", _sec5_codes.size());
+	}
 	return true;
 }
 
@@ -181,6 +211,21 @@ void WtDataWriter::release()
 	{
 		_proc_cond.notify_all();
 		_proc_thrd->join();
+	}
+
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	这里必须join检查线程。
+	 *	原先只join了_proc_thrd，_proc_chk(check_loop)从来没有被回收，
+	 *	而_proc_chk是shared_ptr<std::thread>，析构时线程仍处于joinable状态
+	 *	会直接触发std::terminate。
+	 *	实盘中writer的生命周期和进程一致，走不到这一步所以一直没暴露；
+	 *	但单测里writer是栈对象，一构造一释放就会崩。
+	 */
+	if (_proc_chk)
+	{
+		_proc_chk->join();
+		_proc_chk = NULL;
 	}
 
 	for(auto& v : _rt_ticks_blocks)
@@ -209,6 +254,11 @@ void WtDataWriter::release()
 	}
 
 	for (auto& v : _rt_min5_blocks)
+	{
+		delete v.second;
+	}
+
+	for (auto& v : _rt_sec5_blocks)
 	{
 		delete v.second;
 	}
@@ -1294,6 +1344,124 @@ void WtDataWriter::pipeToKlines(WTSContractInfo* ct, WTSTickData* curTick)
 			}
 		}
 	}
+
+	/*
+	 *	更新5秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	结构与上面的min1/min5段一致，差别只在时间戳的算法：
+	 *	分钟线用 timeToMinutes/minuteToTime + timeToMinBar，
+	 *	秒线用 timeToSeconds/secondsToTime + timeToSecBar(yyyyMMddHHmmss)。
+	 *
+	 *	注意这里不能复用上面算好的 minutes：秒线需要秒级精度，
+	 *	而 minutes 已经被 isLastOfSection 调整过了
+	 */
+	if (_enable_sec5)
+	{
+		KBlockPair* pBlockPair = getKlineBlock(ct, KP_Sec5);
+		if (pBlockPair && pBlockPair->_block)
+		{
+			//tick的秒级时间戳，HHMMSS
+			uint32_t curSecTime = curTick->actiontime() / 1000;
+			uint32_t seconds = sInfo->timeToSeconds(curSecTime);
+			if (seconds != INVALID_UINT32)
+			{
+				SpinLock lock(pBlockPair->_mutex);
+				RTKlineBlock* blk = pBlockPair->_block;
+				if (blk->_size == blk->_capacity)
+				{
+					pBlockPair->_file->sync();
+					pBlockPair->_block = (RTKlineBlock*)resizeRTBlock<RTKlineBlock, WTSBarStruct>(pBlockPair->_file, blk->_capacity * 2);
+					blk = pBlockPair->_block;
+				}
+
+				WTSBarStruct* lastBar = NULL;
+				if (blk->_size > 0)
+				{
+					lastBar = &blk->_bars[blk->_size - 1];
+				}
+
+				//拼接5秒线
+				uint32_t barSecs = (seconds / 5) * 5 + 5;
+				uint32_t barTime = sInfo->secondsToTime(barSecs);
+				uint32_t barDate = uDate;
+				if (barTime < curSecTime)
+				{
+					//bar的收盘时刻小于tick时刻，说明跨日了
+					barDate = TimeUtils::getNextDate(barDate);
+				}
+				uint64_t secBarTime = TimeUtils::timeToSecBar(barDate, barTime);
+
+				bool bNew = false;
+				if (lastBar == NULL || secBarTime > lastBar->time)
+				{
+					bNew = true;
+				}
+
+				WTSBarStruct* newBar = NULL;
+				if (bNew)
+				{
+					newBar = &blk->_bars[blk->_size];
+					blk->_size += 1;
+
+					newBar->date = curTick->tradingdate();
+					newBar->time = secBarTime;
+					newBar->open = curTick->price();
+					newBar->high = curTick->isNewHigh() ? curTick->high() : curTick->price();
+					newBar->low = curTick->isNewLow() ? curTick->low() : curTick->price();
+					newBar->close = curTick->price();
+
+					newBar->vol = curTick->volume();
+					newBar->money = curTick->turnover();
+
+					if (_min_price_mode == 1)
+					{
+						newBar->bid = curTick->bidprice(0);
+						newBar->ask = curTick->askprice(0);
+					}
+					else
+					{
+						newBar->hold = curTick->openinterest();
+						newBar->add = curTick->additional();
+					}
+				}
+				else if (secBarTime == lastBar->time && !(_skip_notrade_tick && tickNoTrade))
+				{
+					//只有时间戳完全相同才累积，时间倒序的tick直接丢弃，不能回写已闭合的bar
+					newBar = &blk->_bars[blk->_size - 1];
+
+					/*
+					 *	By Wesley @ 2023.07.05
+					 *	某些品种开盘时可能推送price为0的tick，会导致open和low都是0
+					 */
+					if (decimal::eq(newBar->open, 0))
+						newBar->open = curTick->price();
+
+					if (decimal::eq(newBar->low, 0))
+						newBar->low = curTick->isNewLow() ? curTick->low() : curTick->price();
+					else
+						newBar->low = curTick->isNewLow() ? curTick->low() : std::min(curTick->price(), newBar->low);
+
+					newBar->close = curTick->price();
+					newBar->high = curTick->isNewHigh() ? curTick->high() : std::max(curTick->price(), newBar->high);
+
+					newBar->vol += curTick->volume();
+					newBar->money += curTick->turnover();
+
+					if (_min_price_mode == 1)
+					{
+						newBar->bid = curTick->bidprice(0);
+						newBar->ask = curTick->askprice(0);
+					}
+					else
+					{
+						newBar->hold = curTick->openinterest();
+						newBar->add += curTick->additional();
+					}
+				}
+			}
+		}
+	}
 }
 
 template<typename T>
@@ -1334,6 +1502,21 @@ WtDataWriter::KBlockPair* WtDataWriter::getKlineBlock(WTSContractInfo* ct, WTSKl
 		subdir = "min5";
 		bType = BT_RT_Minute5;
 		totalMins /= 5;	//如果是5分钟线，要除以5
+		break;
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线要受开关和白名单双重控制，命中不了就当作没开
+	 */
+	case KP_Sec5:
+		if (!_enable_sec5)
+			return NULL;
+		if (!_sec5_codes.empty() && _sec5_codes.find(ct->getFullCode()) == _sec5_codes.end())
+			return NULL;
+		cache_map = &_rt_sec5_blocks;
+		subdir = "sec5";
+		bType = BT_RT_Sec5;
+		//预分配按秒线条数：交易秒数/5
+		totalMins = ct->getCommInfo()->getSessionInfo()->getTradingSeconds() / 5;
 		break;
 	default: break;
 	}
@@ -1618,7 +1801,17 @@ void WtDataWriter::check_loop()
 	uint32_t expire_secs = 600;
 	while(!_terminated)
 	{
-		std::this_thread::sleep_for(std::chrono::seconds(10));
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	原来是一次sleep 10秒，release时要等满10秒才能join上。
+		 *	拆成100毫秒一段并检查_terminated，退出及时很多，
+		 *	对正常运行时的检查周期没有影响。
+		 */
+		for (uint32_t i = 0; i < 100 && !_terminated; i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+		if (_terminated)
+			break;
 		/*
 		 *	By Wesley @ 2022.04.18
 		 *	如果收盘作业线程已经启动，则直接退出检查线程
@@ -1689,6 +1882,17 @@ void WtDataWriter::check_loop()
 			if (kBlk->_lasttime != 0 && (now - kBlk->_lasttime > expire_secs))
 			{
 				pipe_writer_log(_sink, LL_INFO, "min5 cache of {} mapping expired, automatically closed", key);
+				releaseBlock<KBlockPair>(kBlk);
+			}
+		}
+
+		for (auto it = _rt_sec5_blocks.begin(); it != _rt_sec5_blocks.end(); it++)
+		{
+			const char* key = it->first.c_str();
+			KBlockPair* kBlk = (KBlockPair*)it->second;
+			if (kBlk->_lasttime != 0 && (now - kBlk->_lasttime > expire_secs))
+			{
+				pipe_writer_log(_sink, LL_INFO, "sec5 cache of {} mapping expired, automatically closed", key);
 				releaseBlock<KBlockPair>(kBlk);
 			}
 		}
@@ -1811,6 +2015,41 @@ uint32_t WtDataWriter::dump_bars_via_dumper(WTSContractInfo* ct)
 
 	if (kBlkPair)
 		releaseBlock(kBlkPair);
+
+	//第五步,转移实时5秒线
+	//By 秒K线支持 @ 2026.09.20
+	if (_enable_sec5)
+	{
+		kBlkPair = getKlineBlock(ct, KP_Sec5, false);
+		if (kBlkPair != NULL && kBlkPair->_block->_size > 0)
+		{
+			uint32_t size = kBlkPair->_block->_size;
+			pipe_writer_log(_sink, LL_INFO, "Transfering sec5 bars of {}...", ct->getFullCode());
+			SpinLock lock(kBlkPair->_mutex);
+
+			for (auto& item : _dumpers)
+			{
+				const char* id = item.first.c_str();
+				IHisDataDumper* dumper = item.second;
+				if (dumper == NULL)
+					continue;
+
+				bool bSucc = dumper->dumpHisBars(key.c_str(), "s5", kBlkPair->_block->_bars, size);
+				if (!bSucc)
+				{
+					pipe_writer_log(_sink, LL_ERROR, "Closing Task of s5 bar of {} failed via extended dumper {}", ct->getFullCode(), id);
+				}
+			}
+
+			count++;
+
+			//同 min1/min5，这里不能清除数据大小，后面还要存到文件中
+			//kBlkPair->_block->_size = 0;
+		}
+
+		if (kBlkPair)
+			releaseBlock(kBlkPair);
+	}
 
 	return count;
 }
@@ -2210,6 +2449,87 @@ uint32_t WtDataWriter::dump_bars_to_file(WTSContractInfo* ct)
 			releaseBlock(kBlkPair);
 	}
 
+	/*
+	 *	第五步,转移实时5秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	与min1/min5的区别：秒线历史文件存"未压缩"格式(BLOCK_VERSION_RAW_V2)。
+	 *	原因是秒线单合约的dsb可达数百MB，读取侧如果沿用"整文件解压进内存"的做法，
+	 *	取最近150根也要把整个文件读出来。存未压缩才能让读取侧直接mmap+尾部定位。
+	 *
+	 *	注意这里必须用 BlockHeader(12字节) 而不是 BlockHeaderV2(20字节)：
+	 *	proc_block_data 对非压缩数据走的是 erase(0, BLOCK_HEADER_SIZE) 这条分支，
+	 *	用大头会多留8字节导致bar数据整体错位。
+	 */
+	if (_enable_sec5)
+	{
+		KBlockPair* kBlkPair = getKlineBlock(ct, KP_Sec5, false);
+		if (kBlkPair != NULL && kBlkPair->_block->_size > 0)
+		{
+			uint32_t size = kBlkPair->_block->_size;
+			pipe_writer_log(_sink, LL_INFO, "Transfering sec5 bar of {}...", ct->getFullCode());
+			SpinLock lock(kBlkPair->_mutex);
+
+			std::stringstream ss;
+			ss << _base_dir << "his/sec5/" << ct->getExchg() << "/";
+			fs::create_directories(ss.str().c_str());
+			std::string path = ss.str();
+
+			std::string filename = fmtutil::format("{}{}.dsb", path, ct->getCode());
+			//和min1/min5一样要处理郑商所的旧代码文件名
+			if (strcmp(ct->getCode(), ct->getAltCode()) != 0 && strlen(ct->getAltCode()) > 0)
+			{
+				std::string altfilename = fmtutil::format("{}{}.dsb", path, ct->getAltCode());
+				if (StdFile::exists(altfilename.c_str()))
+					rename(altfilename.c_str(), filename.c_str());
+			}
+
+			bool bNew = false;
+			if (!StdFile::exists(filename.c_str()))
+				bNew = true;
+
+			pipe_writer_log(_sink, LL_INFO, "Openning data storage file: {}", filename.c_str());
+
+			BoostFile f;
+			if (f.create_or_open_file(filename.c_str()))
+			{
+				std::string buffer;
+				if (!bNew)
+				{
+					std::string content;
+					StdFile::read_file_content(filename.c_str(), content);
+					//这里会把老文件的头去掉，如果老文件是压缩的也能正确解开
+					proc_block_data(filename.c_str(), content, true, false);
+					buffer.swap(content);
+				}
+
+				buffer.append((const char*)kBlkPair->_block->_bars, sizeof(WTSBarStruct)*size);
+
+				f.truncate_file(0);
+				f.seek_to_begin(0);
+
+				BlockHeader header;
+				memset(&header, 0, sizeof(header));
+				strcpy(header._blk_flag, BLK_FLAG);
+				header._type = BT_HIS_Sec5;
+				header._version = BLOCK_VERSION_RAW_V2;
+				f.write_file(&header, sizeof(header));
+				f.write_file(buffer);
+				count += size;
+
+				//最后将缓存清空
+				kBlkPair->_block->_size = 0;
+			}
+			else
+			{
+				pipe_writer_log(_sink, LL_ERROR, "ClosingTask of sec5 bar failed: openning history data file {} failed", filename.c_str());
+			}
+		}
+
+		if (kBlkPair)
+			releaseBlock(kBlkPair);
+	}
+
 	return count;
 }
 
@@ -2368,6 +2688,8 @@ void WtDataWriter::proc_loop()
 					std::string path = fmtutil::format("{}rt/min1/", _base_dir);
 					fs::remove_all(fs::path(path));
 					path = fmtutil::format("{}rt/min5/", _base_dir);
+					fs::remove_all(fs::path(path));
+					path = fmtutil::format("{}rt/sec5/", _base_dir);
 					fs::remove_all(fs::path(path));
 					path = fmtutil::format("{}rt/ticks/", _base_dir);
 					fs::remove_all(fs::path(path));

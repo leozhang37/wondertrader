@@ -155,6 +155,7 @@ private:
 
 	KBlockFilesMap	_rt_min1_blocks;
 	KBlockFilesMap	_rt_min5_blocks;
+	KBlockFilesMap	_rt_sec5_blocks;
 
 	TickBlockFilesMap	_rt_ticks_blocks;
 	TransBlockFilesMap	_rt_trans_blocks;
@@ -206,6 +207,17 @@ private:
 	bool			_disable_min1;
 	bool			_disable_min5;
 	bool			_disable_day;
+
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线开关采用"显式启用"而不是 disablexxx 的形式。
+	 *	min1/min5 用 disablexxx（缺省 false 即开启）是因为它们本来就是默认落盘的；
+	 *	秒线体积约是 min1 的 12 倍，如果沿用 disable 语义，
+	 *	老配置升级上来会在无感知的情况下数据量暴增，所以必须默认关闭。
+	 */
+	bool			_enable_sec5;
+	//为空表示不限制合约（仍需 _enable_sec5 为 true），非空则只对表内合约落秒线
+	wt_hashset<std::string>	_sec5_codes;
 
 	bool			_disable_trans;
 	bool			_disable_ordque;

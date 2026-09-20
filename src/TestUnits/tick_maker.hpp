@@ -16,6 +16,7 @@
 #pragma once
 #include <vector>
 #include <string.h>
+#include <algorithm>
 
 #include "../Includes/WTSStruct.h"
 #include "../Includes/WTSDataDef.hpp"
@@ -45,9 +46,17 @@ namespace tick_maker
 	 *	造一条tick
 	 *	@hms	HHMMSS
 	 *	@msec	毫秒部分，用来造 113000500 这类超时tick
+	 *	@cum_high/@cum_low	当日累计最高/最低价，传0表示用price填充
+	 *
+	 *	注意 high/low 的语义是"当日累计"，不是该笔的价格。
+	 *	WtDataWriter::updateCache 靠 decimal::gt(newTick.high, cache._tick.high)
+	 *	判断该笔是否创了新高，进而决定 bar 的 high 是直接取 curTick->high()
+	 *	还是 max(price, bar.high)。如果每笔的 high 都填自己的 price，
+	 *	这个判断就会误判成"每笔都创新高"，bar 的高低点会被逐笔覆盖。
 	 */
 	inline WTSTickStruct make(const char* code, uint32_t tdate, uint32_t adate,
-		uint32_t hms, double price, double vol = 1, double turnover = 100, uint32_t msec = 0)
+		uint32_t hms, double price, double vol = 1, double turnover = 100, uint32_t msec = 0,
+		double cum_high = 0, double cum_low = 0)
 	{
 		WTSTickStruct ts;
 		memset(&ts, 0, sizeof(WTSTickStruct));
@@ -61,8 +70,8 @@ namespace tick_maker
 
 		ts.price = price;
 		ts.open = price;
-		ts.high = price;
-		ts.low = price;
+		ts.high = (cum_high > 0) ? cum_high : price;
+		ts.low = (cum_low > 0) ? cum_low : price;
 
 		ts.volume = vol;
 		ts.turn_over = turnover;
@@ -87,10 +96,16 @@ namespace tick_maker
 		std::vector<WTSTickStruct> ret;
 		ret.reserve(count);
 
+		double hi = 0, lo = 0;
 		for (uint32_t i = 0; i < count; i++)
 		{
 			double px = px_seq.empty() ? base_px : px_seq[i % px_seq.size()];
-			ret.emplace_back(make(code, tdate, adate, advance_hms(start_hms, i * step_secs), px));
+
+			//维护当日累计高低价，模拟真实行情快照
+			hi = (i == 0) ? px : std::max(hi, px);
+			lo = (i == 0) ? px : std::min(lo, px);
+
+			ret.emplace_back(make(code, tdate, adate, advance_hms(start_hms, i * step_secs), px, 1, 100, 0, hi, lo));
 		}
 
 		return ret;
