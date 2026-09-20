@@ -83,6 +83,17 @@ class WtEngine : public WtPortContext, public IParserStub
 public:
 	WtEngine();
 
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	原先 WtEngine 完全没有析构函数，于是：
+	 *	1、push_task 起的 _thrd_task 从不被回收。它阻塞在 _cond_task.wait()，
+	 *	   而 _terminated 也没人置位，析构时线程仍joinable，直接 std::terminate。
+	 *	2、作为 WtCtaEngine/WtSelEngine/WtHftEngine 的基类却没有虚析构，
+	 *	   一旦有人通过 WtEngine* 释放派生对象就是未定义行为。
+	 *	实盘中引擎与进程同寿、且是成员对象不走基类指针，所以两点都没暴露
+	 */
+	virtual ~WtEngine();
+
 	inline void set_adapter_mgr(TraderAdapterMgr* mgr) { _adapter_mgr = mgr; }
 
 	void set_date_time(uint32_t curDate, uint32_t curTime, uint32_t curSecs = 0, uint32_t rawTime = 0);

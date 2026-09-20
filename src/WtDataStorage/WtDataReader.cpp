@@ -2056,8 +2056,18 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 		rtCnt = 0;
 		hisCnt = count;
 		hisCnt = min(hisCnt, (uint32_t)barsList._bars.size());
-		head = &barsList._bars[barsList._bars.size() - hisCnt];
-		slice->appendBlock(head, hisCnt);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先没有 hisCnt != 0 的判断，而上面 bHasToday 的两个分支都有。
+		 *	历史数据为空时 &_bars[0] 是对空vector取地址，属于未定义行为，
+		 *	Release下会直接段错误(Debug下往往看不出来)。
+		 *	无历史数据是完全正常的情形(新合约、新装的环境)，所以要补上
+		 */
+		if (hisCnt != 0)
+		{
+			head = &barsList._bars[barsList._bars.size() - hisCnt];
+			slice->appendBlock(head, hisCnt);
+		}
 	}
 
 	pipe_reader_log(_sink, LL_DEBUG, "His {} bars of {} loaded, {} from history, {} from realtime", PERIOD_NAME[period], stdCode, hisCnt, rtCnt);

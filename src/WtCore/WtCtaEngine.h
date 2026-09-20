@@ -85,6 +85,18 @@ private:
 
 	WtCtaRtTicker*	_tm_ticker;
 
+	/*
+	 *	上次做"定期刷新"的本地时间(毫秒)
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	on_schedule 末尾的 save_datas 和 refresh_funds 都是定期性质的，
+	 *	秒线作主周期后调度频率涨12倍，这两件事都要节流：
+	 *	- save_datas 是组合持仓/资金的全量JSON落盘，成交时另有调用点会存
+	 *	- refresh_funds 会向每个交易通道发查询资金请求，而 queryFund
+	 *	  直接调 _trader_api->queryAccount() 没有任何流控保护，
+	 *	  每5秒一次纯属浪费交易通道带宽，多账户时还有触发流控的风险
+	 */
+	uint64_t		_last_periodic_time;
+
 	WtExecuterMgr	_exec_mgr;
 
 	WTSVariant*		_cfg;

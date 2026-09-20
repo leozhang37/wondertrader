@@ -7,7 +7,7 @@
 
 #include "mock_datasink.hpp"
 #include "tick_maker.hpp"
-#include "../WtDataStorage/WtDataWriter.h"
+#include "storage_loader.hpp"
 #include "../Includes/WTSVariant.hpp"
 #include "../Share/StdUtils.hpp"
 #include "../Share/StrUtil.hpp"
@@ -88,7 +88,9 @@ TEST(test_secbar_writer, disabled_by_default_writes_nothing)
 	std::string dir = temp_root("off");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	//注意这里不传 enablesec5，模拟老配置升级上来的情形
 	WTSVariant* cfg = make_cfg(dir, false);
 	ASSERT_TRUE(writer.init(cfg, &sink));
@@ -107,6 +109,7 @@ TEST(test_secbar_writer, disabled_by_default_writes_nothing)
 	EXPECT_FALSE(StdFile::exists(path.c_str())) << "sec5 must stay off unless explicitly enabled";
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -119,7 +122,9 @@ TEST(test_secbar_writer, rt_block_bars_and_ohlc)
 	std::string dir = temp_root("rt");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	WTSVariant* cfg = make_cfg(dir, true);
 	ASSERT_TRUE(writer.init(cfg, &sink));
 
@@ -172,6 +177,7 @@ TEST(test_secbar_writer, rt_block_bars_and_ohlc)
 	EXPECT_EQ(bars[0].date, TDATE);
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -184,7 +190,9 @@ TEST(test_secbar_writer, whitelist_filters_contracts)
 	std::string dir = temp_root("wl");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	//白名单里放一个别的合约，当前合约不应落秒线
 	WTSVariant* cfg = make_cfg(dir, true, "TEST.hc2610");
 	ASSERT_TRUE(writer.init(cfg, &sink));
@@ -202,6 +210,7 @@ TEST(test_secbar_writer, whitelist_filters_contracts)
 	EXPECT_FALSE(StdFile::exists(path.c_str())) << "contract not in whitelist must be skipped";
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -214,7 +223,9 @@ TEST(test_secbar_writer, whitelist_hit_writes_bars)
 	std::string dir = temp_root("wl2");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	//白名单命中（顺便验证逗号分隔与空格容忍）
 	WTSVariant* cfg = make_cfg(dir, true, "TEST.hc2610, TEST.rb2610");
 	ASSERT_TRUE(writer.init(cfg, &sink));
@@ -234,6 +245,7 @@ TEST(test_secbar_writer, whitelist_hit_writes_bars)
 	EXPECT_EQ(bars.size(), 2u);
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -249,7 +261,9 @@ TEST(test_secbar_writer, section_end_tick_stays_in_section)
 	std::string dir = temp_root("sect");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	WTSVariant* cfg = make_cfg(dir, true);
 	ASSERT_TRUE(writer.init(cfg, &sink));
 
@@ -283,6 +297,7 @@ TEST(test_secbar_writer, section_end_tick_stays_in_section)
 	}
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -298,7 +313,9 @@ TEST(test_secbar_writer, out_of_session_tick_ignored)
 	std::string dir = temp_root("oos");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	WTSVariant* cfg = make_cfg(dir, true);
 	ASSERT_TRUE(writer.init(cfg, &sink));
 
@@ -327,6 +344,7 @@ TEST(test_secbar_writer, out_of_session_tick_ignored)
 	EXPECT_DOUBLE_EQ(bars[0].close, 100.0);
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -343,7 +361,9 @@ TEST(test_secbar_writer, resize_keeps_all_bars)
 	std::string dir = temp_root("resize");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	WTSVariant* cfg = make_cfg(dir, true);
 	ASSERT_TRUE(writer.init(cfg, &sink));
 
@@ -374,6 +394,7 @@ TEST(test_secbar_writer, resize_keeps_all_bars)
 	}
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -390,7 +411,9 @@ TEST(test_secbar_writer, his_dsb_is_uncompressed_with_small_header)
 	std::string dir = temp_root("his");
 	MockWriterSink sink(&bd, TDATE);
 
-	WtDataWriter writer;
+	IDataWriter* pw = storage_loader::make_writer();
+	ASSERT_NE(pw, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataWriter& writer = *pw;
 	WTSVariant* cfg = make_cfg(dir, true);
 	ASSERT_TRUE(writer.init(cfg, &sink));
 
@@ -445,6 +468,7 @@ TEST(test_secbar_writer, his_dsb_is_uncompressed_with_small_header)
 	}
 
 	writer.release();
+	storage_loader::free_writer(pw);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);

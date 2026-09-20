@@ -12,8 +12,7 @@
 
 #include "mock_datasink.hpp"
 #include "tick_maker.hpp"
-#include "../WtDataStorage/WtDataWriter.h"
-#include "../WtDataStorage/WtDataReader.h"
+#include "storage_loader.hpp"
 #include "../Includes/WTSVariant.hpp"
 #include "../Share/StdUtils.hpp"
 #include "../Share/BoostFile.hpp"
@@ -108,7 +107,9 @@ TEST(test_secbar_reader, read_from_history_only)
 	//把当前时刻设在历史数据之后的另一天，确保 bHasToday 为 false
 	sink.set_time(20260921, 1000, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -121,6 +122,7 @@ TEST(test_secbar_reader, read_from_history_only)
 	EXPECT_EQ(slice->at(-1)->time, expectLast);
 
 	slice->release();
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -142,7 +144,9 @@ TEST(test_secbar_reader, tail_load_does_not_read_whole_file)
 	MockReaderSink sink(&bd);
 	sink.set_time(20260921, 1000, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -164,6 +168,7 @@ TEST(test_secbar_reader, tail_load_does_not_read_whole_file)
 	EXPECT_EQ(slice->at(-1)->time, expectLast);
 
 	slice->release();
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -182,7 +187,9 @@ TEST(test_secbar_reader, reload_when_more_bars_requested)
 	MockReaderSink sink(&bd);
 	sink.set_time(20260921, 1000, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -198,6 +205,7 @@ TEST(test_secbar_reader, reload_when_more_bars_requested)
 	EXPECT_EQ(s2->size(), 1200) << "reader should reload more bars from file when asked for more";
 	s2->release();
 
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -224,7 +232,9 @@ TEST(test_secbar_reader, etime_locates_rt_block_by_second)
 	const uint32_t BARS = 20;
 	{
 		MockWriterSink wsink(&bd, R_TDATE);
-		WtDataWriter writer;
+		IDataWriter* pw = storage_loader::make_writer();
+		ASSERT_NE(pw, nullptr);
+		IDataWriter& writer = *pw;
 		WTSVariant* wcfg = WTSVariant::createObject();
 		wcfg->append("path", dir.c_str());
 		wcfg->append("async", false);
@@ -249,13 +259,16 @@ TEST(test_secbar_reader, etime_locates_rt_block_by_second)
 			tick->release();
 		}
 		writer.release();
+		storage_loader::free_writer(pw);
 		wcfg->release();
 	}
 
 	MockReaderSink sink(&bd);
 	sink.set_time(R_TDATE, 900, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -282,6 +295,7 @@ TEST(test_secbar_reader, etime_locates_rt_block_by_second)
 	}
 
 	slice->release();
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -302,7 +316,9 @@ TEST(test_secbar_reader, etime_does_not_trim_history_only_reads)
 	//当前时刻在另一天，没有当日实时数据
 	sink.set_time(20260921, 1000, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -318,6 +334,7 @@ TEST(test_secbar_reader, etime_does_not_trim_history_only_reads)
 	EXPECT_EQ(slice->at(-1)->time, lastOfFile);
 
 	slice->release();
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -335,7 +352,9 @@ TEST(test_secbar_reader, on_second_end_emits_bars_in_order)
 	//先用writer造出 rt/sec5 的实时块
 	{
 		MockWriterSink wsink(&bd, R_TDATE);
-		WtDataWriter writer;
+		IDataWriter* pw = storage_loader::make_writer();
+		ASSERT_NE(pw, nullptr);
+		IDataWriter& writer = *pw;
 		WTSVariant* wcfg = WTSVariant::createObject();
 		wcfg->append("path", dir.c_str());
 		wcfg->append("async", false);
@@ -361,13 +380,16 @@ TEST(test_secbar_reader, on_second_end_emits_bars_in_order)
 			tick->release();
 		}
 		writer.release();
+		storage_loader::free_writer(pw);
 		wcfg->release();
 	}
 
 	MockReaderSink sink(&bd);
 	sink.set_time(R_TDATE, 900, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -402,6 +424,7 @@ TEST(test_secbar_reader, on_second_end_emits_bars_in_order)
 	}
 	EXPECT_EQ(sink.bars().size(), cntBefore) << "replaying the same timestamps must not re-emit bars";
 
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);
@@ -453,7 +476,9 @@ TEST(test_secbar_reader, compressed_his_file_still_readable)
 	MockReaderSink sink(&bd);
 	sink.set_time(20260921, 1000, 0);
 
-	WtDataReader reader;
+	IDataReader* prd = storage_loader::make_reader();
+	ASSERT_NE(prd, nullptr) << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+	IDataReader& reader = *prd;
 	WTSVariant* cfg = r_make_cfg(dir);
 	reader.init(cfg, &sink);
 
@@ -463,6 +488,7 @@ TEST(test_secbar_reader, compressed_his_file_still_readable)
 	EXPECT_EQ(slice->at(-1)->time, TimeUtils::timeToSecBar(R_TDATE, tick_maker::advance_hms(90005, 299 * 5)));
 
 	slice->release();
+	storage_loader::free_reader(prd);
 	cfg->release();
 	sInfo->release();
 	fs::remove_all(dir);

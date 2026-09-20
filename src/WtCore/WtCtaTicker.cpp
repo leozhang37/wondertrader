@@ -391,7 +391,14 @@ void WtCtaRtTicker::run()
 				}
 				else
 				{
-					std::this_thread::sleep_for(std::chrono::seconds(10));
+					/*
+					 *	By 秒K线支持 @ 2026.09.20
+					 *	原来是一次sleep 10秒，stop()要等满10秒才能join上。
+					 *	拆成100毫秒一段并检查_stopped，退出及时很多，
+					 *	对非交易时段的轮询周期没有实质影响
+					 */
+					for (uint32_t i = 0; i < 100 && !_stopped; i++)
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
 			}
 		}
