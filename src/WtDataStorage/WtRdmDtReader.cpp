@@ -1696,6 +1696,18 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByRange(const std::string& key, ui
 		{
 			if ((isDay && eit->date > eBar.date) || (!isDay && eit->time > eBar.time))
 			{
+				/*
+				 *	结束时间早于第一条K线，即查询区间整个落在数据之前，没有数据可返回
+				 *	原先直接 eit-- 会退到 begin() 之前，后面 lower_bound(begin, eit)
+				 *	的区间是反的，直接崩。readBarsFromCacheByRange 里本来就有这个保护
+				 *	By 秒K线支持 @ 2026.09.20
+				 */
+				if (eit == barsList._bars.begin())
+				{
+					count = 0;
+					return NULL;
+				}
+
 				eit--;
 			}
 
@@ -1745,6 +1757,13 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByCount(const std::string& key, ui
 	{
 		if ((isDay && eit->date > eBar.date) || (!isDay && eit->time > eBar.time))
 		{
+			//同 indexBarFromCacheByRange：结束时间早于第一条K线时没有数据可返回
+			if (eit == barsList._bars.begin())
+			{
+				count = 0;
+				return NULL;
+			}
+
 			eit--;
 		}
 
@@ -1766,6 +1785,9 @@ uint32_t WtRdmDtReader::readBarsFromCacheByRange(const std::string& key, uint64_
 	lTime = (uint32_t)(stime % 10000);
 
 	BarsList& barsList = _bars_cache[key];
+	if (barsList._bars.empty())
+		return 0;
+
 	std::size_t eIdx,sIdx;
 	{
 		WTSBarStruct eBar;

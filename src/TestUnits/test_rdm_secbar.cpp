@@ -84,6 +84,40 @@ namespace
 		fs::create_directories(dir);
 		return dir;
 	}
+
+	//造 his/min1 历史文件，09:01 起每分钟一根。用来证明越界保护对分钟线同样成立
+	uint32_t r2_write_his_min1(const std::string& dir, uint32_t count)
+	{
+		std::string path = fmtutil::format("{}his/min1/{}/", dir, R2_EXCHG);
+		fs::create_directories(path);
+
+		std::vector<WTSBarStruct> bars;
+		bars.resize(count);
+		for (uint32_t i = 0; i < count; i++)
+		{
+			uint32_t h = 9, m = 1 + i;
+			h += m / 60; m %= 60;
+			uint32_t hm = h * 100 + m;
+
+			bars[i].date = R2_TDATE;
+			bars[i].time = (uint64_t)(R2_TDATE - 19900000) * 10000 + hm;
+			bars[i].open = bars[i].high = bars[i].low = bars[i].close = 200.0 + i;
+			bars[i].vol = 20;
+		}
+
+		BlockHeader hdr;
+		memset(&hdr, 0, sizeof(hdr));
+		strcpy(hdr._blk_flag, BLK_FLAG);
+		hdr._type = BT_HIS_Minute1;
+		hdr._version = BLOCK_VERSION_RAW_V2;
+
+		BoostFile f;
+		f.create_new_file(fmtutil::format("{}{}.dsb", path, R2_CODE));
+		f.write_file(&hdr, sizeof(hdr));
+		f.write_file(bars.data(), sizeof(WTSBarStruct) * count);
+		f.close_file();
+		return count;
+	}
 }
 
 TEST(test_rdm_secbar, sec5_by_count)
@@ -187,6 +221,71 @@ TEST(test_rdm_secbar, sec5_by_range)
 		<< "last bar is " << lastHms << ", looks like the bound was truncated to whole minutes";
 
 	slice->release();
+	cfg->release();
+	storage_loader::free_rdm_reader(rd);
+	sInfo->release();
+	fs::remove_all(dir);
+}
+
+/*
+ *	查询区间整个落在数据之前，必须返回空而不是崩
+ *
+ *	这是在验证 wtpy 的 get_bars_by_date 时撞出来的：
+ *	WTSBaseDataMgr::getBoundaryTime 碰到周末会把起始边界挪到下一交易日、
+ *	结束边界挪到上一交易日，于是 stime > etime，整个区间落在数据之外。
+ *	indexBarFromCacheByRange / ByCount 里 eit 已经在 begin() 上还继续 eit--，
+ *	退到容器之前，后面 lower_bound(begin, eit) 拿到一个反向区间，直接 SIGSEGV。
+ *	readBarsFromCacheByRange 里本来就有这个保护，另两个漏了。
+ *
+ *	跟秒线无关，分钟线一样会崩；只是原先 get_bars_by_date 对秒线直接 return NULL，
+ *	放开秒线以后这条路径才被新暴露出来，所以一并修掉。
+ */
+TEST(test_rdm_secbar, range_entirely_before_data_returns_null)
+{
+	IRdmDtReader* rd = storage_loader::make_rdm_reader();
+	ASSERT_NE(rd, nullptr);
+
+	WTSSessionInfo* sInfo = r2_make_sess();
+	MockBaseDataMgr bd(R2_EXCHG, R2_PID, R2_CODE, sInfo, R2_TDATE);
+	std::string dir = r2_temp("oob");
+	//数据从 09:00:05 起
+	r2_write_his(dir, 300);
+	r2_write_his_min1(dir, 60);
+
+	MockRdmSink sink(&bd);
+	WTSVariant* cfg = WTSVariant::createObject();
+	cfg->append("path", dir.c_str());
+	rd->init(cfg, &sink);
+
+	//08:20 ~ 08:30，全部早于第一根K线
+	uint64_t stime = (uint64_t)R2_TDATE * 10000 + 820;
+	uint64_t etime = (uint64_t)R2_TDATE * 10000 + 830;
+
+	//秒线
+	WTSKlineSlice* s1 = rd->readKlineSliceByRange(R2_STDCODE, KP_Sec5, stime, etime);
+	EXPECT_EQ(s1, nullptr) << "sec5 by_range should be empty when the range ends before all data";
+	if (s1 != NULL) s1->release();
+
+	WTSKlineSlice* s2 = rd->readKlineSliceByCount(R2_STDCODE, KP_Sec5, 50, etime);
+	EXPECT_EQ(s2, nullptr) << "sec5 by_count should be empty when etime is before all data";
+	if (s2 != NULL) s2->release();
+
+	//分钟线：同一个保护，证明修的是通用路径
+	WTSKlineSlice* s3 = rd->readKlineSliceByRange(R2_STDCODE, KP_Minute1, stime, etime);
+	EXPECT_EQ(s3, nullptr) << "min1 by_range should be empty when the range ends before all data";
+	if (s3 != NULL) s3->release();
+
+	WTSKlineSlice* s4 = rd->readKlineSliceByCount(R2_STDCODE, KP_Minute1, 50, etime);
+	EXPECT_EQ(s4, nullptr) << "min1 by_count should be empty when etime is before all data";
+	if (s4 != NULL) s4->release();
+
+	//确认数据本身是读得到的，上面的空不是因为文件没造对
+	uint64_t okEtime = (uint64_t)R2_TDATE * 10000 + 920;
+	WTSKlineSlice* ok = rd->readKlineSliceByCount(R2_STDCODE, KP_Sec5, 10, okEtime);
+	ASSERT_NE(ok, nullptr) << "the fixture itself is broken: no sec5 data readable at all";
+	EXPECT_GT(ok->size(), 0);
+	ok->release();
+
 	cfg->release();
 	storage_loader::free_rdm_reader(rd);
 	sInfo->release();
