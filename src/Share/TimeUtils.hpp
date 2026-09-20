@@ -347,6 +347,41 @@ namespace TimeUtils
 		return (uint32_t)(minTime%10000);
 	}
 
+	/*
+	 *	秒线bar时间戳编码：yyyyMMddHHmmss
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	与分钟线的 timeToMinBar 不同，秒线不减 19900000 偏移，直接用完整日期。
+	 *	原因：
+	 *	1、减偏移是为了让 bar 时间塞进 WTSBarStructOld.time（uint32_t）。
+	 *	   (date-19900000)*10000+HHMM 约 3.67e9，刚好落在 uint32 的 4.29e9 内；
+	 *	   而完整日期的 date*10000+HHMM 约 2.0e11 会溢出。
+	 *	   新的 WTSBarStruct.time 是 uint64_t，秒线没有这个约束。
+	 *	2、WTSDataFactory::extractKlineData(WTSTickSlice*, seconds, ...) 早已在用
+	 *	   actDt*1000000+HHMMSS 这个编码（WtDtServo 的 get_sbars / wtpy 侧在用），
+	 *	   沿用它才能向后兼容，否则会破坏已有行为。
+	 *
+	 *	20991231 235959 -> 20991231235959，约 2.1e13，uint64_t 富余。
+	 *	与分钟线编码（约 3.5e8）相差 5 个数量级，一旦两种编码被误比较会立刻暴露。
+	 *
+	 *	日期部分取自然日（action_date），与 timeToMinBar 的用法一致；
+	 *	bar 的 date 字段另存交易日（trading_date）。
+	 */
+	constexpr static inline uint64_t timeToSecBar(uint32_t uDate, uint32_t uTime) noexcept
+	{
+		return (uint64_t)uDate * 1000000 + uTime;
+	}
+
+	constexpr static inline uint32_t secBarToDate(uint64_t secTime) noexcept
+	{
+		return (uint32_t)(secTime / 1000000);
+	}
+
+	constexpr static inline uint32_t secBarToTime(uint64_t secTime) noexcept
+	{
+		return (uint32_t)(secTime % 1000000);
+	}
+
 	static inline bool isWeekends(uint32_t uDate) noexcept
 	{
 		tm t;	

@@ -66,6 +66,29 @@ protected:
 	WTSBarStruct* updateDayData(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick);
 	WTSBarStruct* updateSecData(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick);
 
+	/*
+	 *	秒线更新（KP_Sec5，times为5秒的倍数）
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	WTSBarStruct* updateSec5Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick, bool bAlignSec = false);
+	WTSBarStruct* updateSec5Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSBarStruct* newBasicBar, bool bAlignSec = false);
+
+	/*
+	 *	秒线更新的公共核心
+	 *	@seconds	目标周期秒数
+	 *	updateSecData（KP_Tick，times直接是秒数）和
+	 *	updateSec5Data（KP_Sec5，times是5秒的倍数）都走这里
+	 */
+	WTSBarStruct* updateSecBar(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick, uint32_t seconds, bool bAlignSec = false);
+
+	/*
+	 *	按交易秒序号计算bar的对齐秒序号
+	 *	@curSecs	当前tick的交易秒序号（sInfo->timeToSeconds的结果）
+	 *	@seconds	目标周期秒数
+	 *	@bAlignSec	是否按小节对齐（小节结束处强制对齐，不跨小节）
+	 */
+	static uint32_t alignBarSeconds(WTSSessionInfo* sInfo, uint32_t curSecs, uint32_t seconds, bool bAlignSec);
+
 	WTSBarStruct* updateMin1Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSBarStruct* newBasicBar, bool bAlignSec = false);
 	WTSBarStruct* updateMin5Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSBarStruct* newBasicBar, bool bAlignSec = false);
 
@@ -79,6 +102,12 @@ protected:
 	WTSKlineData* extractHalfData(WTSKlineSlice* baseKline, WTSSessionInfo* sInfo, bool bIncludeOpen = true);
 
 	WTSKlineData* extractDayData(WTSKlineSlice* baseKline, uint32_t times, bool bIncludeOpen = true);
+
+	/*
+	 *	从sec5基础线重采样到 5*times 秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	WTSKlineData* extractSec5Data(WTSKlineSlice* baseKline, uint32_t times, WTSSessionInfo* sInfo, bool bIncludeOpen = true, bool bAlignSec = false);
 
 protected:
 	static uint32_t getPrevMinute(uint32_t curMinute, int period = 1);

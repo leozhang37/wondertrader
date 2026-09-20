@@ -42,6 +42,8 @@ WTSBarStruct* WTSDataFactory::updateKlineData(WTSKlineData* klineData, WTSTickDa
 		return updateMin5Data(sInfo, klineData, tick, bAlignSec);
 	case KP_DAY:
 		return updateDayData(sInfo, klineData, tick);
+	case KP_Sec5:
+		return updateSec5Data(sInfo, klineData, tick, bAlignSec);
 	default:
 		return NULL;
 	}
@@ -66,6 +68,8 @@ WTSBarStruct* WTSDataFactory::updateKlineData(WTSKlineData* klineData, WTSBarStr
 		return updateHourData(sInfo, klineData, newBasicBar);
 	case KP_Half:
 		return updateHalfData(sInfo, klineData, newBasicBar);
+	case KP_Sec5:
+		return updateSec5Data(sInfo, klineData, newBasicBar, bAlignSec);
 	default:
 		return NULL;
 	}
@@ -705,49 +709,226 @@ WTSBarStruct* WTSDataFactory::updateDayData(WTSSessionInfo* sInfo, WTSKlineData*
 	}
 }
 
-WTSBarStruct* WTSDataFactory::updateSecData(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick)
+/*
+ *	按交易秒序号计算bar的对齐秒序号
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	sInfo->timeToSeconds 返回的是"从开盘算起的累计交易秒序号"，
+ *	并且已经处理了小节结束时刻的归属（seconds == stopSecs 时 offset--），
+ *	所以落在小节结束秒上的tick会归到该小节最后一根，与min1的 minutes-- 处理一致
+ */
+uint32_t WTSDataFactory::alignBarSeconds(WTSSessionInfo* sInfo, uint32_t curSecs, uint32_t seconds, bool bAlignSec)
 {
-	uint32_t seconds = klineData->times();
-	uint32_t curSeconds = sInfo->timeToSeconds(tick->actiontime()/1000);
-	uint32_t barSeconds = (curSeconds/seconds)*seconds + seconds;
-	uint32_t barTime = sInfo->secondsToTime(barSeconds);
+	if (!bAlignSec)
+		return (curSecs / seconds)*seconds + seconds;
 
-	if(klineData->isUnixTime())
+	/*
+	 *	按小节对齐：
+	 *	小节边界一定落在整分钟上（addTradingSection的参数是HHMM），
+	 *	所以 getSecMinList() 的累计分钟数 *60 就是累计秒边界
+	 */
+	const std::vector<uint32_t>& secMins = sInfo->getSecMinList();
+	uint32_t prevBound = 0;
+	uint32_t curBound = 0;
+	for (auto it = secMins.begin(); it != secMins.end(); it++)
 	{
-		uint32_t uDate = tick->actiondate();
-		if (barTime < tick->actiontime() / 1000)
-			uDate = TimeUtils::getNextDate(uDate);
-		barTime = (uint32_t)(TimeUtils::makeTime(uDate, barTime * 1000) / 1000);
-	}	
+		curBound = (*it) * 60;
+		if (curSecs < curBound)
+			break;
+		prevBound = curBound;
+	}
 
-	uint64_t lastTime = klineData->time(klineData->size()-1);
-	if(lastTime == INVALID_UINT32 || lastTime != barTime)
+	uint32_t offset = curSecs - prevBound;
+	uint32_t barSecs = prevBound + (offset / seconds)*seconds + seconds;
+
+	//小节结束处强制对齐，不允许跨小节
+	if (barSecs > curBound)
+		barSecs = curBound;
+
+	return barSecs;
+}
+
+/*
+ *	秒线更新的公共核心
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	这里修复了原 updateSecData 的两个缺陷：
+ *	1、新bar只是 new 出来返回，既没有 appendBar 也没有 delete
+ *	   —— klineData 永远不增长，导致下一个tick的 time(size-1) 仍返回 INVALID_UINT32，
+ *	      每个tick都被判成"新bar"，OHLC累积分支永远走不到，同时每次都泄漏一个 WTSBarStruct
+ *	2、barTime 是裸 HHMMSS 不含日期，跨日/跨小节排序会错
+ *	   —— 统一改用 TimeUtils::timeToSecBar（yyyyMMddHHmmss）
+ *
+ *	返回值约定与 updateMin1Data 一致：产生新bar时返回容器内的指针，否则返回NULL
+ */
+WTSBarStruct* WTSDataFactory::updateSecBar(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick, uint32_t seconds, bool bAlignSec /* = false */)
+{
+	if (sInfo == NULL || klineData == NULL || tick == NULL || seconds == 0)
+		return NULL;
+
+	uint32_t uTime = tick->actiontime() / 1000;	//HHMMSS
+	uint32_t curSecs = sInfo->timeToSeconds(uTime);
+	if (curSecs == INVALID_UINT32)
 	{
-		WTSBarStruct *day = new WTSBarStruct;
-		day->date = tick->tradingdate();
-		day->time = barTime;
-		day->open = tick->price();
-		day->high = tick->price();
-		day->low = tick->price();
-		day->close = tick->price();
-		day->vol = tick->volume();
-		day->money = tick->turnover();
-		day->hold = tick->openinterest();
-		day->add = tick->additional();
+		//非交易时间的tick直接丢弃，不能让它污染已有的bar
+		return NULL;
+	}
 
-		return day;
+	uint32_t barSecs = alignBarSeconds(sInfo, curSecs, seconds, bAlignSec);
+	uint32_t barTime = sInfo->secondsToTime(barSecs);
+	if (barTime == INVALID_UINT32)
+		return NULL;
+
+	uint32_t uDate = tick->actiondate();
+	if (barTime < uTime)
+	{
+		//bar的收盘时刻小于tick时刻，说明跨日了
+		uDate = TimeUtils::getNextDate(uDate);
+	}
+
+	uint64_t uBarTime = 0;
+	if (klineData->isUnixTime())
+		uBarTime = (uint64_t)TimeUtils::makeTime(uDate, (long)barTime * 1000) / 1000;
+	else
+		uBarTime = TimeUtils::timeToSecBar(uDate, barTime);
+
+	WTSBarStruct* lastBar = NULL;
+	if (klineData->size() > 0)
+		lastBar = klineData->at(-1);
+
+	if (lastBar == NULL || uBarTime > lastBar->time || tick->tradingdate() > lastBar->date)
+	{
+		WTSBarStruct newBar;
+		newBar.date = tick->tradingdate();
+		newBar.time = uBarTime;
+		newBar.open = tick->price();
+		newBar.high = tick->price();
+		newBar.low = tick->price();
+		newBar.close = tick->price();
+		newBar.vol = tick->volume();
+		newBar.money = tick->turnover();
+		newBar.hold = tick->openinterest();
+		newBar.add = tick->additional();
+
+		klineData->appendBar(newBar);
+		return klineData->at(-1);
+	}
+	else if (uBarTime < lastBar->time)
+	{
+		//时间倒序的tick，不能回写已闭合的bar
+		return NULL;
 	}
 	else
 	{
-		WTSBarStruct *bar = klineData->at(klineData->size()-1);
-		bar->close = tick->price();
-		bar->high = max(bar->high,tick->price());
-		bar->low = min(bar->low,tick->price());
-		bar->vol += tick->volume();
-		bar->money += tick->turnover();
-		bar->hold = tick->openinterest();
-		bar->add += tick->additional();
+		lastBar->close = tick->price();
+		lastBar->high = max(lastBar->high, tick->price());
+		lastBar->low = min(lastBar->low, tick->price());
+		lastBar->vol += tick->volume();
+		lastBar->money += tick->turnover();
+		lastBar->hold = tick->openinterest();
+		lastBar->add += tick->additional();
 
+		return NULL;
+	}
+}
+
+/*
+ *	KP_Tick 路径：times 直接就是秒数
+ *	WtDtServo 的 get_sbars / update_bars 走这里
+ */
+WTSBarStruct* WTSDataFactory::updateSecData(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick)
+{
+	if (klineData == NULL)
+		return NULL;
+
+	return updateSecBar(sInfo, klineData, tick, klineData->times(), false);
+}
+
+/*
+ *	KP_Sec5 路径：times 是5秒的倍数
+ */
+WTSBarStruct* WTSDataFactory::updateSec5Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSTickData* tick, bool bAlignSec /* = false */)
+{
+	if (klineData == NULL)
+		return NULL;
+
+	return updateSecBar(sInfo, klineData, tick, klineData->times() * 5, bAlignSec);
+}
+
+/*
+ *	KP_Sec5 路径：用已闭合的sec5基础线更新更大的秒周期
+ */
+WTSBarStruct* WTSDataFactory::updateSec5Data(WTSSessionInfo* sInfo, WTSKlineData* klineData, WTSBarStruct* newBasicBar, bool bAlignSec /* = false */)
+{
+	if (sInfo == NULL || klineData == NULL || newBasicBar == NULL)
+		return NULL;
+
+	//一倍周期直接追加
+	if (klineData->times() == 1)
+	{
+		klineData->appendBar(*newBasicBar);
+		klineData->setClosed(true);
+		return klineData->at(-1);
+	}
+
+	uint32_t steplen = klineData->times() * 5;
+
+	const WTSBarStruct& curBar = *newBasicBar;
+
+	uint32_t uDate = TimeUtils::secBarToDate(curBar.time);
+	uint32_t uTime = TimeUtils::secBarToTime(curBar.time);
+	uint32_t curSecs = sInfo->timeToSeconds(uTime);
+	if (curSecs == INVALID_UINT32)
+		return NULL;
+
+	/*
+	 *	基础线的时间戳是"闭合时刻"，如090005代表090000~090004这5秒，
+	 *	所以要先退一秒再对齐，和 extractMin1Data 里的 uMinute -= 1 同理
+	 */
+	if (curSecs > 0)
+		curSecs -= 1;
+
+	uint32_t barSecs = alignBarSeconds(sInfo, curSecs, steplen, bAlignSec);
+	uint32_t barTime = sInfo->secondsToTime(barSecs);
+	if (barTime == INVALID_UINT32)
+		return NULL;
+
+	if (barTime < uTime)
+		uDate = TimeUtils::getNextDate(uDate);
+
+	uint64_t uBarTime = TimeUtils::timeToSecBar(uDate, barTime);
+
+	WTSBarStruct* lastBar = NULL;
+	if (klineData->size() > 0)
+		lastBar = klineData->at(-1);
+
+	if (lastBar == NULL || uBarTime > lastBar->time)
+	{
+		WTSBarStruct newBar;
+		memcpy(&newBar, &curBar, sizeof(WTSBarStruct));
+		newBar.time = uBarTime;
+
+		klineData->appendBar(newBar);
+		klineData->setClosed(uBarTime == curBar.time);
+		return klineData->at(-1);
+	}
+	else if (uBarTime < lastBar->time)
+	{
+		return NULL;
+	}
+	else
+	{
+		lastBar->high = max(lastBar->high, curBar.high);
+		lastBar->low = min(lastBar->low, curBar.low);
+		lastBar->close = curBar.close;
+		lastBar->settle = curBar.settle;
+		lastBar->vol += curBar.vol;
+		lastBar->money += curBar.money;
+		lastBar->add += curBar.add;
+		lastBar->hold = curBar.hold;
+
+		//时间戳一致说明这一根正好闭合
+		klineData->setClosed(uBarTime == curBar.time);
 		return NULL;
 	}
 }
@@ -785,6 +966,10 @@ WTSKlineData* WTSDataFactory::extractKlineData(WTSKlineSlice* baseKline, WTSKlin
 	{
 		return extractDayData(baseKline, times, bIncludeOpen);
 	}
+	else if(period == KP_Sec5)
+	{
+		return extractSec5Data(baseKline, times, sInfo, bIncludeOpen, bAlignSec);
+	}
 	else if(period == KP_Minute1)
 	{
 		return extractMin1Data(baseKline, times, sInfo, bIncludeOpen, bAlignSec);
@@ -800,6 +985,104 @@ WTSKlineData* WTSDataFactory::extractKlineData(WTSKlineSlice* baseKline, WTSKlin
 	}
 	
 	return NULL;
+}
+
+/*
+ *	从sec5基础线重采样到 5*times 秒线
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	结构完全照 extractMin1Data，差别只在：
+ *	1、时间编码用 secBarToDate/secBarToTime（yyyyMMddHHmmss）
+ *	2、步长单位是秒，且 steplen = 5*times
+ *	3、对齐逻辑抽到 alignBarSeconds，与 updateSec5Data 共用同一套规则
+ */
+WTSKlineData* WTSDataFactory::extractSec5Data(WTSKlineSlice* baseKline, uint32_t times, WTSSessionInfo* sInfo, bool bIncludeOpen /* = true */, bool bAlignSec /* = false */)
+{
+	if (sInfo == NULL || baseKline == NULL || baseKline->size() == 0)
+		return NULL;
+
+	uint32_t steplen = times * 5;
+
+	WTSKlineData* ret = WTSKlineData::create(baseKline->code(), 0);
+	ret->setPeriod(KP_Sec5, times);
+
+	for (auto i = 0; i < baseKline->size(); i++)
+	{
+		const WTSBarStruct& curBar = *baseKline->at(i);
+
+		uint32_t uDate = TimeUtils::secBarToDate(curBar.time);
+		uint32_t uTime = TimeUtils::secBarToTime(curBar.time);
+		uint32_t curSecs = sInfo->timeToSeconds(uTime);
+		if (curSecs == INVALID_UINT32)
+			continue;
+
+		/*
+		 *	基础线时间戳是闭合时刻（090005 代表 090000~090004），
+		 *	先退一秒再对齐，同 extractMin1Data 的 uMinute -= 1
+		 */
+		if (curSecs > 0)
+			curSecs -= 1;
+
+		uint32_t barSecs = alignBarSeconds(sInfo, curSecs, steplen, bAlignSec);
+		uint32_t barTime = sInfo->secondsToTime(barSecs);
+		if (barTime == INVALID_UINT32)
+			continue;
+
+		if (barTime < uTime)
+			uDate = TimeUtils::getNextDate(uDate);
+
+		uint64_t uBarTime = TimeUtils::timeToSecBar(uDate, barTime);
+
+		WTSBarStruct* lastBar = NULL;
+		if (ret->size() > 0)
+			lastBar = ret->at(ret->size() - 1);
+
+		bool bNewBar = false;
+		if (lastBar == NULL || lastBar->time != uBarTime)
+		{
+			lastBar = new WTSBarStruct();
+			bNewBar = true;
+
+			memcpy(lastBar, &curBar, sizeof(WTSBarStruct));
+			lastBar->time = uBarTime;
+		}
+		else
+		{
+			lastBar->high = max(lastBar->high, curBar.high);
+			lastBar->low = min(lastBar->low, curBar.low);
+			lastBar->close = curBar.close;
+			lastBar->settle = curBar.settle;
+
+			lastBar->vol += curBar.vol;
+			lastBar->money += curBar.money;
+			lastBar->add += curBar.add;
+			lastBar->hold = curBar.hold;
+		}
+
+		if (bNewBar)
+		{
+			ret->appendBar(*lastBar);
+			delete lastBar;
+		}
+	}
+
+	if (ret->size() == 0)
+		return ret;
+
+	//检查最后一条：如果目标K线的时间戳超过了原始K线最后一条，说明未闭合
+	{
+		WTSBarStruct* lastRawBar = baseKline->at(-1);
+		WTSBarStruct* lastDesBar = ret->at(-1);
+		if (lastDesBar->time > lastRawBar->time)
+		{
+			if (!bIncludeOpen)
+				ret->getDataRef().resize(ret->size() - 1);
+			else
+				ret->setClosed(false);
+		}
+	}
+
+	return ret;
 }
 
 WTSKlineData* WTSDataFactory::extractMin1Data(WTSKlineSlice* baseKline, uint32_t times, WTSSessionInfo* sInfo, bool bIncludeOpen /* = true */, bool bAlignSec /* = false */)
@@ -1345,7 +1628,8 @@ WTSKlineData* WTSDataFactory::extractKlineData(WTSTickSlice* ayTicks, uint32_t s
 		}
 		else
 		{
-			barTime = (uint64_t)actDt * 1000000 + barTime;
+			//等价于原来的 actDt*1000000+barTime，提取成命名函数便于全局统一
+			barTime = TimeUtils::timeToSecBar(actDt, (uint32_t)barTime);
 		}
 
 		bool bNewBar = false;
