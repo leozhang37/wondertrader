@@ -1147,6 +1147,7 @@ bool WtRdmDtReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key,
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1826,6 +1827,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByRange(const char* stdCode, WTSKlin
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -2255,6 +2257,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByCount(const char* stdCode, WTSKlin
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 

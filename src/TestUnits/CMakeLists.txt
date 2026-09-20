@@ -16,6 +16,7 @@ file(GLOB SRCS *.cpp ./gtest/*.cc)
 # 只导出 createDataReader 之类的工厂函数，WtDataWriter 这样的内部类
 # 无法从外部链接，所以这里把源文件纳入本工程一起编译。
 LIST(APPEND SRCS ../WtDataStorage/WtDataWriter.cpp)
+LIST(APPEND SRCS ../WtDataStorage/WtDataReader.cpp)
 
 SET(LIBS
     WTSTools

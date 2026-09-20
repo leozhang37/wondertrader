@@ -104,6 +104,7 @@ private:
 
 	RTKBlockFilesMap	_rt_min1_map;
 	RTKBlockFilesMap	_rt_min5_map;
+	RTKBlockFilesMap	_rt_sec5_map;
 
 	TBlockFilesMap		_rt_tick_map;
 	TransBlockFilesMap	_rt_trans_map;
@@ -192,7 +193,19 @@ private:
 	/*
 	 *	将历史数据放入缓存
 	 */
-	bool	cacheHisBarsFromFile(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period);
+	/*
+	 *	@tailCount	只加载历史文件末尾的条数，0表示全量
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线单合约的dsb可达数百MB，全量读进内存不现实，所以要支持只取尾部
+	 */
+	bool	cacheHisBarsFromFile(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period, uint32_t tailCount = 0);
+
+	/*
+	 *	读取未压缩历史文件的尾部若干条K线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	返回实际读到的条数，0表示失败或文件不是未压缩格式
+	 */
+	uint32_t	readTailBarsFromRawFile(const char* filename, uint32_t tailCount, std::vector<WTSBarStruct>& bars);
 	bool	cacheFinalBarsFromLoader(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period);
 
 
@@ -203,6 +216,8 @@ public:
 	virtual void init(WTSVariant* cfg, IDataReaderSink* sink, IHisDataLoader* loader = NULL) override;
 
 	virtual void onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate = 0) override;
+
+	virtual void onSecondEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate = 0) override;
 
 	virtual WTSTickSlice*	readTickSlice(const char* stdCode, uint32_t count, uint64_t etime = 0) override;
 	virtual WTSOrdDtlSlice*	readOrdDtlSlice(const char* stdCode, uint32_t count, uint64_t etime = 0) override;
@@ -235,13 +250,24 @@ private:
 		std::vector<WTSBarStruct>	_bars;
 		double			_factor;
 
-		_BarsList() :_rt_cursor(UINT_MAX), _factor(DBL_MAX){}
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	历史段按尾部加载时，记录当时请求的条数。
+		 *	后续如果请求了更多条数，需要重新从文件多读一些，
+		 *	0表示是全量加载的(min1/min5/day)，不存在这个问题
+		 */
+		uint32_t		_his_tail;
+
+		_BarsList() :_rt_cursor(UINT_MAX), _factor(DBL_MAX), _his_tail(0){}
 	} BarsList;
 
 	typedef wt_hashmap<std::string, BarsList> BarsCache;
 	BarsCache	_bars_cache;
 
 	uint64_t	_last_time;
+	//秒线的推进游标，和_last_time分开，两条轴互不干扰
+	//By 秒K线支持 @ 2026.09.20
+	uint64_t	_last_sec_time;
 
 	//除权因子
 	typedef struct _AdjFactor
