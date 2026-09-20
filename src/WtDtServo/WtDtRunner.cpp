@@ -219,7 +219,25 @@ WTSKlineSlice* WtDtRunner::get_bars_by_range(const char* stdCode, const char* pe
 
 	WTSKlinePeriod kp;
 	uint32_t realTimes = times;
-	if (basePeriod[0] == 'm')
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	和实盘/回测的周期映射保持一致：KP_Sec5 本身代表5秒，
+	 *	所以 "s5"->realTimes=1 直读，"s10"/"s15"/... 走重采样。
+	 *	这样 wtpy 侧不需要新接口，get_bars(code, "s5", ...) 直接可用
+	 */
+	if (basePeriod[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		realTimes = times / 5;
+	}
+	else if (basePeriod[0] == 'm')
 	{
 		if (times % 5 == 0)
 		{
@@ -259,7 +277,25 @@ WTSKlineSlice* WtDtRunner::get_bars_by_date(const char* stdCode, const char* per
 
 	WTSKlinePeriod kp;
 	uint32_t realTimes = times;
-	if (basePeriod[0] == 'm')
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	和实盘/回测的周期映射保持一致：KP_Sec5 本身代表5秒，
+	 *	所以 "s5"->realTimes=1 直读，"s10"/"s15"/... 走重采样。
+	 *	这样 wtpy 侧不需要新接口，get_bars(code, "s5", ...) 直接可用
+	 */
+	if (basePeriod[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		realTimes = times / 5;
+	}
+	else if (basePeriod[0] == 'm')
 	{
 		if (times % 5 == 0)
 		{
@@ -328,7 +364,25 @@ WTSKlineSlice* WtDtRunner::get_bars_by_count(const char* stdCode, const char* pe
 
 	WTSKlinePeriod kp;
 	uint32_t realTimes = times;
-	if (basePeriod[0] == 'm')
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	和实盘/回测的周期映射保持一致：KP_Sec5 本身代表5秒，
+	 *	所以 "s5"->realTimes=1 直读，"s10"/"s15"/... 走重采样。
+	 *	这样 wtpy 侧不需要新接口，get_bars(code, "s5", ...) 直接可用
+	 */
+	if (basePeriod[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		realTimes = times / 5;
+	}
+	else if (basePeriod[0] == 'm')
 	{
 		if (times % 5 == 0)
 		{
@@ -618,7 +672,26 @@ void WtDtRunner::sub_bar(const char* stdCode, const char* period)
 
 	WTSKlinePeriod kp;
 	uint32_t realTimes = times;
-	if (basePeriod[0] == 'm')
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	和实盘/回测的周期映射保持一致：KP_Sec5 本身代表5秒，
+	 *	所以 "s5"->realTimes=1 直读，"s10"/"s15"/... 走重采样。
+	 *	这样 wtpy 侧不需要新接口，get_bars(code, "s5", ...) 直接可用
+	 */
+	if (basePeriod[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			//sub_bar 是 void 返回
+			return;
+		}
+
+		kp = KP_Sec5;
+		realTimes = times / 5;
+	}
+	else if (basePeriod[0] == 'm')
 	{
 		if (times % 5 == 0)
 		{

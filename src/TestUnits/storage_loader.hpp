@@ -21,6 +21,7 @@
 #include "../WtDataStorage/DataDefine.h"
 #include "../Includes/IDataReader.h"
 #include "../Includes/IDataWriter.h"
+#include "../Includes/IRdmDtReader.h"
 #include "../Share/DLLHelper.hpp"
 #include "../Share/StrUtil.hpp"
 
@@ -108,6 +109,25 @@ namespace storage_loader
 			return NULL;
 		}
 		return f();
+	}
+
+	//DtServo 查询用的随机读取模块
+	inline IRdmDtReader* make_rdm_reader()
+	{
+		DllHandle h = load();
+		if (h == NULL) return NULL;
+		typedef IRdmDtReader* (*FuncCreate)();
+		FuncCreate f = (FuncCreate)DLLHelper::get_symbol(h, "createRdmDtReader");
+		return (f != NULL) ? f() : NULL;
+	}
+
+	inline void free_rdm_reader(IRdmDtReader* r)
+	{
+		if (r == NULL) return;
+		DllHandle h = load();
+		typedef void (*FuncDelete)(IRdmDtReader*);
+		FuncDelete f = (FuncDelete)DLLHelper::get_symbol(h, "deleteRdmDtReader");
+		if (f != NULL) f(r);
 	}
 
 	inline void free_reader(IDataReader* r)

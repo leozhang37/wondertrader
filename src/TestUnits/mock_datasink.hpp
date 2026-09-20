@@ -12,6 +12,7 @@
 
 #include "../Includes/IDataWriter.h"
 #include "../Includes/IDataReader.h"
+#include "../Includes/IRdmDtReader.h"
 #include "../Includes/IBaseDataMgr.h"
 #include "../Includes/WTSContractInfo.hpp"
 #include "../Includes/WTSSessionInfo.hpp"
@@ -219,5 +220,35 @@ private:
 	bool					_verbose;
 	std::vector<BarEvent>	_bars;
 	std::vector<uint32_t>	_updates;
+	std::vector<std::string> _logs;
+};
+
+/*
+ *	随机读取模块(DtServo查询用)的回调桩
+ *	接口只有三个方法，比 IDataReaderSink 更简单：没有时间来源，
+ *	因为查询接口的时间范围是调用方直接给的
+ */
+class MockRdmSink : public IRdmDtReaderSink
+{
+public:
+	MockRdmSink(MockBaseDataMgr* bd) : _bd(bd), _verbose(false) {}
+
+	void set_verbose(bool b) { _verbose = b; }
+
+	virtual IBaseDataMgr* get_basedata_mgr() override { return _bd; }
+	virtual IHotMgr* get_hot_mgr() override { return NULL; }
+
+	virtual void reader_log(WTSLogLevel ll, const char* message) override
+	{
+		_logs.emplace_back(message);
+		if (_verbose)
+			printf("[rdm] %s\n", message);
+	}
+
+	const std::vector<std::string>& logs() const { return _logs; }
+
+private:
+	MockBaseDataMgr*	_bd;
+	bool				_verbose;
 	std::vector<std::string> _logs;
 };
