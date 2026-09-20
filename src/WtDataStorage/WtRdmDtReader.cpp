@@ -51,6 +51,23 @@ extern "C"
  */
 extern bool proc_block_data(std::string& content, bool isBar, bool bKeepHead = true);
 
+/*
+ *	把 yyyyMMddHHmm 形式的查询边界换成与bar时间戳同编码的值
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	分钟线的bar时间戳是 (date-19900000)*10000+HHMM，
+ *	秒线是 yyyyMMddHHmmss，两者差5个数量级不能混比。
+ *	查询接口给的边界只到分钟，所以秒线的上界要补到该分钟的第59秒，
+ *	否则 11:30 这一分钟内的秒线会被整分钟切掉
+ */
+static inline uint64_t make_bar_bound(WTSKlinePeriod period, uint32_t uDate, uint32_t hm, bool bUpper)
+{
+	if (period == KP_Sec5)
+		return TimeUtils::timeToSecBar(uDate, hm * 100 + (bUpper ? 59 : 0));
+
+	return (uint64_t)(uDate - 19900000) * 10000 + hm;
+}
+
 WtRdmDtReader::WtRdmDtReader()
 	: _base_data_mgr(NULL)
 	, _hot_mgr(NULL)
@@ -87,7 +104,20 @@ void WtRdmDtReader::init(WTSVariant* cfg, IRdmDtReaderSink* sink)
 	_thrd_check.reset(new StdThread([this]() {
 		while(!_stopped)
 		{
-			std::this_thread::sleep_for(std::chrono::seconds(5));
+			/*
+			 *	By 秒K线支持 @ 2026.09.20
+			 *	原先是一次 sleep 5秒。析构里会 join 这个线程，
+			 *	于是每次销毁 reader 都要干等满5秒——
+			 *	DtServo 反复创建查询实例时这个代价很直接。
+			 *	拆成100毫秒一段并检查 _stopped，退出及时，
+			 *	对缓存回收的周期没有实质影响
+			 */
+			for (uint32_t i = 0; i < 50 && !_stopped; i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+			if (_stopped)
+				break;
+
 			uint64_t now = TimeUtils::getLocalTimeNow();
 
 			for(auto& m : _rt_tick_map)
@@ -1147,6 +1177,7 @@ bool WtRdmDtReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key,
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1626,7 +1657,7 @@ bool WtRdmDtReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key,
 	return true;
 }
 
-WTSBarStruct* WtRdmDtReader::indexBarFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, uint32_t& count, bool isDay /* = false */)
+WTSBarStruct* WtRdmDtReader::indexBarFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, uint32_t& count, bool isDay /* = false */, bool isSec /* = false */)
 {
 	uint32_t rDate, rTime, lDate, lTime;
 	rDate = (uint32_t)(etime / 10000);
@@ -1645,11 +1676,11 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByRange(const std::string& key, ui
 
 		WTSBarStruct eBar;
 		eBar.date = rDate;
-		eBar.time = (rDate - 19900000) * 10000 + rTime;
+		eBar.time = make_bar_bound(isSec ? KP_Sec5 : KP_Minute1, rDate, rTime, true);
 
 		WTSBarStruct sBar;
 		sBar.date = lDate;
-		sBar.time = (lDate - 19900000) * 10000 + lTime;
+		sBar.time = make_bar_bound(isSec ? KP_Sec5 : KP_Minute1, lDate, lTime, false);
 
 		auto eit = std::lower_bound(barsList._bars.begin(), barsList._bars.end(), eBar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b){
 			if (isDay)
@@ -1685,7 +1716,7 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByRange(const std::string& key, ui
 	return &barsList._bars[sIdx];
 }
 
-WTSBarStruct* WtRdmDtReader::indexBarFromCacheByCount(const std::string& key, uint64_t etime, uint32_t& count, bool isDay /* = false */)
+WTSBarStruct* WtRdmDtReader::indexBarFromCacheByCount(const std::string& key, uint64_t etime, uint32_t& count, bool isDay /* = false */, bool isSec /* = false */)
 {
 	uint32_t rDate, rTime;
 	rDate = (uint32_t)(etime / 10000);
@@ -1698,7 +1729,7 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByCount(const std::string& key, ui
 	std::size_t eIdx, sIdx;
 	WTSBarStruct eBar;
 	eBar.date = rDate;
-	eBar.time = (rDate - 19900000) * 10000 + rTime;
+	eBar.time = make_bar_bound(isSec ? KP_Sec5 : KP_Minute1, rDate, rTime, true);
 
 	auto eit = std::lower_bound(barsList._bars.begin(), barsList._bars.end(), eBar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b) {
 		if (isDay)
@@ -1726,7 +1757,7 @@ WTSBarStruct* WtRdmDtReader::indexBarFromCacheByCount(const std::string& key, ui
 	return &barsList._bars[sIdx];
 }
 
-uint32_t WtRdmDtReader::readBarsFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, std::vector<WTSBarStruct>& ayBars, bool isDay /* = false */)
+uint32_t WtRdmDtReader::readBarsFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, std::vector<WTSBarStruct>& ayBars, bool isDay /* = false */, bool isSec /* = false */)
 {
 	uint32_t rDate, rTime, lDate, lTime;
 	rDate = (uint32_t)(etime / 10000);
@@ -1739,11 +1770,11 @@ uint32_t WtRdmDtReader::readBarsFromCacheByRange(const std::string& key, uint64_
 	{
 		WTSBarStruct eBar;
 		eBar.date = rDate;
-		eBar.time = (rDate - 19900000) * 10000 + rTime;
+		eBar.time = make_bar_bound(isSec ? KP_Sec5 : KP_Minute1, rDate, rTime, true);
 
 		WTSBarStruct sBar;
 		sBar.date = lDate;
-		sBar.time = (lDate - 19900000) * 10000 + lTime;
+		sBar.time = make_bar_bound(isSec ? KP_Sec5 : KP_Minute1, lDate, lTime, false);
 
 		auto eit = std::lower_bound(barsList._bars.begin(), barsList._bars.end(), eBar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b){
 			if (isDay)
@@ -1826,6 +1857,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByRange(const char* stdCode, WTSKlin
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1849,11 +1881,11 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByRange(const char* stdCode, WTSKlin
 
 	WTSBarStruct eBar;
 	eBar.date = rDate;
-	eBar.time = (rDate - 19900000) * 10000 + rTime;
+	eBar.time = make_bar_bound(period, rDate, rTime, true);
 
 	WTSBarStruct sBar;
 	sBar.date = lDate;
-	sBar.time = (lDate - 19900000) * 10000 + lTime;
+	sBar.time = make_bar_bound(period, lDate, lTime, false);
 
 	bool bNeedHisData = true;
 
@@ -1984,7 +2016,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByRange(const char* stdCode, WTSKlin
 
 	if (bNeedHisData)
 	{
-		hisHead = indexBarFromCacheByRange(key, stime, etime, hisCnt, period == KP_DAY);
+		hisHead = indexBarFromCacheByRange(key, stime, etime, hisCnt, period == KP_DAY, period == KP_Sec5);
 	}
 
 	if (hisCnt + rtCnt > 0)
@@ -2255,6 +2287,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByCount(const char* stdCode, WTSKlin
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -2277,7 +2310,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByCount(const char* stdCode, WTSKlin
 
 	WTSBarStruct eBar;
 	eBar.date = rDate;
-	eBar.time = (rDate - 19900000) * 10000 + rTime;
+	eBar.time = make_bar_bound(period, rDate, rTime, true);
 
 
 	bool bNeedHisData = true;
@@ -2376,7 +2409,7 @@ WTSKlineSlice* WtRdmDtReader::readKlineSliceByCount(const char* stdCode, WTSKlin
 	if (bNeedHisData)
 	{
 		hisCnt = count - rtCnt;
-		hisHead = indexBarFromCacheByCount(key, etime, hisCnt, period == KP_DAY);
+		hisHead = indexBarFromCacheByCount(key, etime, hisCnt, period == KP_DAY, period == KP_Sec5);
 	}
 
 	pipe_rdmreader_log(_sink, LL_DEBUG, "His {} bars of {} loaded, {} from history, {} from realtime", PERIOD_NAME[period], stdCode, hisCnt, rtCnt);

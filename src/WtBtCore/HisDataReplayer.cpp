@@ -147,6 +147,7 @@ HisDataReplayer::HisDataReplayer()
 	, _cur_date(0)
 	, _cur_time(0)
 	, _cur_secs(0)
+	, _sec_now_stamp(0)
 	, _cur_tdate(0)
 	, _tick_enabled(true)
 	, _opened_tdate(0)
@@ -793,33 +794,71 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 	for (; !_terminated;)
 	{
 		bool isDay = barsList->_period == KP_DAY;
+		/*
+		 *	主K线是秒线时，时间轴要切到秒精度
+		 *	By 秒K线支持 @ 2026.09.20
+		 *
+		 *	分钟线的轴是 date*10000+HHMM，秒线的bar时间戳本身就是
+		 *	yyyyMMddHHmmss，两者量级差5个数量级不能混用。
+		 *	这里按主K线的周期分成两条轨，其余逻辑(小节、交易日切换、
+		 *	tick模拟)完全共用，只是 nextTime 的格式不同
+		 */
+		bool isSecMain = (barsList->_period == KP_Sec5);
 		if (barsList->_cursor != UINT_MAX)
 		{
 			uint64_t nextBarTime = 0;
 			if (isDay)
 				nextBarTime = (uint64_t)barsList->_bars[barsList->_cursor].date * 10000 + sInfo->getCloseTime();
+			else if (isSecMain)
+			{
+				//已经是 yyyyMMddHHmmss，不需要补偏移
+				nextBarTime = (uint64_t)barsList->_bars[barsList->_cursor].time;
+			}
 			else
 			{
 				nextBarTime = (uint64_t)barsList->_bars[barsList->_cursor].time;
 				nextBarTime += 199000000000;
 			}
 
-			if (nextBarTime > _end_time)
+			/*
+			 *	_end_time 是配置里给的 yyyyMMddHHmm(分钟精度)，
+			 *	秒线的时间戳要降到分钟再比，否则永远判成越界
+			 */
+			uint64_t cmpEnd = isSecMain ? (nextBarTime / 100) : nextBarTime;
+			if (cmpEnd > _end_time)
 			{
 				WTSLogger::info("{} is beyond ending time {},replaying done", nextBarTime, _end_time);
 				break;
 			}
 
-			uint32_t nextDate = (uint32_t)(nextBarTime / 10000);
-			uint32_t nextTime = (uint32_t)(nextBarTime % 10000);
+			uint32_t nextDate = 0;
+			uint32_t nextTime = 0;	//秒线为HHMMSS，其余为HHMM
+			if (isSecMain)
+			{
+				nextDate = TimeUtils::secBarToDate(nextBarTime);
+				nextTime = TimeUtils::secBarToTime(nextBarTime);
+			}
+			else
+			{
+				nextDate = (uint32_t)(nextBarTime / 10000);
+				nextTime = (uint32_t)(nextBarTime % 10000);
+			}
+
+			/*
+			 *	下面这些地方(小节判断、交易日计算、_cur_time)的语义都是HHMM，
+			 *	秒线模式下要把秒位去掉再用
+			 *	By 秒K线支持 @ 2026.09.20
+			 */
+			uint32_t nextMin = isSecMain ? (nextTime / 100) : nextTime;
+			uint32_t nextSecOfMin = isSecMain ? (nextTime % 100) : 0;
 
 			//By Wesley @ 2022.01.10
 			//如果和收盘时间一样，进行这个判断
 			//主要针对7*24小时的品种，其他的品种不需要
 			uint32_t nextTDate = _opened_tdate;
-			if(isDay || (!isDay && sInfo->offsetTime(nextTime, false) != sInfo->getCloseTime(true)))
+			if(isDay || (!isDay && sInfo->offsetTime(nextMin, false) != sInfo->getCloseTime(true)))
 			{
-				nextTDate = _bd_mgr.calcTradingDate(commId.c_str(), nextDate, nextTime, false);
+				nextTDate = _bd_mgr.calcTradingDate(commId.c_str(), nextDate, nextMin, false);
 				if (_opened_tdate != nextTDate)
 				{
 					if(_closed_tdate != _opened_tdate)
@@ -863,8 +902,10 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 			}
 
 			_cur_date = nextDate;
-			_cur_time = nextTime;
-			_cur_secs = 0;
+			//_cur_time 一直是HHMM，秒的部分走 _cur_secs(毫秒)
+			//By 秒K线支持 @ 2026.09.20
+			_cur_time = nextMin;
+			_cur_secs = nextSecOfMin * 1000;
 
 			bool isEndTDate = (sInfo->offsetTime(_cur_time, false) >= sInfo->getCloseTime(true));
 
@@ -879,19 +920,25 @@ void HisDataReplayer::run_by_bars(bool bNeedDump /* = false */)
 			 */
 			for(int i = 0; i < 4; i++)
 			{
+				//simTicks 内部按分钟定位bar，传HHMM
 				if (_tick_simulated)
-					simTicks(nextDate, nextTime, (isDay || isEndTDate) ? nextTDate : 0, i);
+					simTicks(nextDate, nextMin, (isDay || isEndTDate) ? nextTDate : 0, i);
 
 				if (!_tick_enabled)
 					simTickWithUnsubBars(curBarTime, nextBarTime, (isDay || isEndTDate) ? nextTDate : 0, i);
 			}
 
+			/*
+			 *	onMinuteEnd 里靠 uTime 的位数判断精度：
+			 *	秒线模式传HHMMSS，其余传HHMM
+			 *	By 秒K线支持 @ 2026.09.20
+			 */
 			onMinuteEnd(nextDate, nextTime, (isDay || isEndTDate) ? nextTDate : 0, _tick_simulated);
 
 			replayed_barcnt += 1;
 
-			if(sInfo->isLastOfSection(nextTime))
-				_listener->handle_section_end(nextDate, nextTime);
+			if(sInfo->isLastOfSection(nextMin))
+				_listener->handle_section_end(nextDate, nextMin);
 
 			if (isEndTDate && _closed_tdate != _cur_tdate)
 			{
@@ -1996,6 +2043,17 @@ void HisDataReplayer::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTD
 	//这里应该触发检查
 	uint64_t nowTime = (uint64_t)uDate * 10000 + uTime;
 
+	/*
+	 *	同步秒精度的时间轴
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	uTime 的格式取决于主K线：秒线回放时是HHMMSS，其余是HHMM。
+	 *	按位数判断，这样不用改所有调用点的签名
+	 */
+	if (uTime > 2400)
+		_sec_now_stamp = TimeUtils::timeToSecBar(uDate, uTime);			//HHMMSS
+	else
+		_sec_now_stamp = TimeUtils::timeToSecBar(uDate, uTime * 100);	//HHMM，秒位补0
+
 	for (auto it = _bars_cache.begin(); it != _bars_cache.end(); it++)
 	{
 		BarsListPtr& barsList = (BarsListPtr&)it->second;
@@ -2009,11 +2067,24 @@ void HisDataReplayer::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTD
 				{
 					WTSBarStruct& nextBar = barsList->_bars[barsList->_cursor];
 
-					uint64_t barTime = 199000000000 + nextBar.time;
-					if (barTime <= nowTime)
+					/*
+					 *	By 秒K线支持 @ 2026.09.20
+					 *	秒线的bar时间戳是 yyyyMMddHHmmss，不需要补199000000000；
+					 *	分钟线是 (date-19900000)*10000+HHMM，要补回去才能和 nowTime 比
+					 */
+					bool isSecBar = (barsList->_period == KP_Sec5);
+					uint64_t barTime = isSecBar ? nextBar.time : (199000000000 + nextBar.time);
+					uint64_t cmpTime = isSecBar ? _sec_now_stamp : nowTime;
+
+					if (barTime <= cmpTime)
 					{
 						uint32_t times = barsList->_times;
-						if (times == PERIOD_TIMES_HOUR)
+						if (isSecBar)
+						{
+							//KP_Sec5的times是5秒的倍数，还原成秒数给策略
+							_listener->handle_bar_close(barsList->_code.c_str(), "s", times * 5, &nextBar);
+						}
+						else if (times == PERIOD_TIMES_HOUR)
 							_listener->handle_bar_close(barsList->_code.c_str(), "h", 1, &nextBar);
 						else if (times == PERIOD_TIMES_HALF)
 							_listener->handle_bar_close(barsList->_code.c_str(), "f", 1, &nextBar);
@@ -2106,8 +2177,15 @@ void HisDataReplayer::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTD
 		}
 	}
 
+	/*
+	 *	handle_schedule 的时间参数语义是HHMM
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	下游 CtaMocker::on_schedule 里要用 sInfo->offsetTime(curTime) 和
+	 *	getCloseTime 比较，传HHMMSS会把它判成已收盘，直接跳过 on_calculate。
+	 *	秒的部分已经通过 _cur_secs 传递，和实盘的处理一致
+	 */
 	if (_listener)
-		_listener->handle_schedule(uDate, uTime);
+		_listener->handle_schedule(uDate, uTime > 2400 ? (uTime / 100) : uTime);
 }
 
 WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char* period, uint32_t count, uint32_t times /* = 1 */, bool isMain /* = false */)
@@ -2179,6 +2257,25 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 		kp = KP_Minute5;
 		baseTimes = 5;
 		realTimes = PERIOD_TIMES_HOUR;
+	}
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	和实盘的 WtEngine::get_kline_slice 保持一致：
+	 *	KP_Sec5 本身代表5秒，所以 "s5"->times=1 直读，
+	 *	"s10"/"s15"/... -> times=2/3/... 走重采样
+	 */
+	else if (strcmp(period, "s") == 0)
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		baseTimes = 5;
+		realTimes = times / 5;
 	}
 	else
 		kp = KP_DAY;

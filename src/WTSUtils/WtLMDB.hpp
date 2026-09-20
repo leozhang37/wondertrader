@@ -66,7 +66,16 @@ public:
 #if _WIN32
 			_mkdir(path);
 #else
-			mkdir(path, 777);
+			/*
+			 *	By 秒K线支持 @ 2026.09.20
+			 *	原先是 mkdir(path, 777)，777是十进制，当作mode用就是八进制01411，
+			 *	也就是 owner 只有读权限(dr----x--x)，
+			 *	LMDB 随后无法在里面创建 data.mdb/lock.mdb，open 直接失败。
+			 *	也就是说AD存储在目录不存在时(首次启用)必然打不开。
+			 *	仓库里 src/testdb 那个权限异常的目录就是这么来的。
+			 *	正确写法是八进制 0777
+			 */
+			mkdir(path, 0777);
 #endif
 		}
 

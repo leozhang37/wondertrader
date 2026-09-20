@@ -83,6 +83,17 @@ class WtEngine : public WtPortContext, public IParserStub
 public:
 	WtEngine();
 
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	原先 WtEngine 完全没有析构函数，于是：
+	 *	1、push_task 起的 _thrd_task 从不被回收。它阻塞在 _cond_task.wait()，
+	 *	   而 _terminated 也没人置位，析构时线程仍joinable，直接 std::terminate。
+	 *	2、作为 WtCtaEngine/WtSelEngine/WtHftEngine 的基类却没有虚析构，
+	 *	   一旦有人通过 WtEngine* 释放派生对象就是未定义行为。
+	 *	实盘中引擎与进程同寿、且是成员对象不走基类指针，所以两点都没暴露
+	 */
+	virtual ~WtEngine();
+
 	inline void set_adapter_mgr(TraderAdapterMgr* mgr) { _adapter_mgr = mgr; }
 
 	void set_date_time(uint32_t curDate, uint32_t curTime, uint32_t curSecs = 0, uint32_t rawTime = 0);
@@ -93,6 +104,15 @@ public:
 	inline uint32_t get_min_time() { return _cur_time; }
 	inline uint32_t get_raw_time() { return _cur_raw_time; }
 	inline uint32_t get_secs() { return _cur_secs; }
+
+	/*
+	 *	是否有策略订阅了秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	ticker据此决定要不要做秒级推进，没人订阅就不做，避免无谓开销。
+	 *	订阅发生在策略的on_init里，而ticker是在on_init之后才启动线程的，
+	 *	所以读这个标记的时机是安全的
+	 */
+	inline bool has_sec_subs() const { return _has_sec_subs; }
 	inline uint32_t get_trading_date() { return _cur_tdate; }
 
 	inline IBaseDataMgr*		get_basedata_mgr(){ return _base_data_mgr; }
@@ -332,5 +352,8 @@ protected:
 
 	//用于标记是否可以推送tickle
 	bool			_ready;
+	//有策略订阅了秒线
+	//By 秒K线支持 @ 2026.09.20
+	bool			_has_sec_subs;
 };
 NS_WTP_END

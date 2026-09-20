@@ -106,7 +106,14 @@ typedef enum tagKlinePeriod : uint32_t
 	KP_Minute5,
 	KP_DAY,
 	KP_Hour,	//小时线
-	KP_Half		//半小时线
+	KP_Half,	//半小时线
+	/*
+	 *	5秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	必须追加在枚举末尾：KP_Minute1=1 等既有数值一旦变化，
+	 *	已落盘的数据、外部loader、wtpy侧的period数值都会错位
+	 */
+	KP_Sec5
 } WTSKlinePeriod;
 
 constexpr static uint32_t PERIOD_TIMES_HOUR = 0xffffffff;
@@ -119,7 +126,8 @@ static const char* PERIOD_NAME[] =
 	"min5",
 	"day",
 	"hour",
-	"half"
+	"half",
+	"sec5"
 };
 
 /*

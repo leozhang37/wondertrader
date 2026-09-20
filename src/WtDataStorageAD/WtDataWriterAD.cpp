@@ -54,10 +54,20 @@ static const uint32_t CACHE_SIZE_STEP_AD = 400;
 
 WtDataWriterAD::WtDataWriterAD()
 	: _terminated(false)
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	_async_task 原先既不在初始化列表里，也没有从配置读取，
+	 *	是个未初始化的bool：每次进程启动，落库是同步还是异步取决于
+	 *	那块内存里的垃圾值，完全不确定。
+	 *	而异步路径下 release() 又会丢任务(见下面的 task_loop)，
+	 *	也就是说收盘时可能丢掉最后一批K线
+	 */
+	, _async_task(false)
 	, _log_group_size(1000)
 	, _disable_day(false)
 	, _disable_min1(false)
 	, _disable_min5(false)
+	, _enable_sec5(false)
 	, _disable_tick(false)
 	, _tick_cache_block(nullptr)
 	, _tick_mapsize(16*1024*1024)
@@ -83,14 +93,44 @@ bool WtDataWriterAD::init(WTSVariant* params, IDataWriterSink* sink)
 	_cache_file_tick = "cache_tick.dmb";
 	_m1_cache._filename = "cache_m1.dmb";
 	_m5_cache._filename = "cache_m5.dmb";
+	_s5_cache._filename = "cache_s5.dmb";
 	_d1_cache._filename = "cache_d1.dmb";
 
 	_log_group_size = params->getUInt32("groupsize");
+
+	//落库是否走异步任务线程，缺省同步
+	//By 秒K线支持 @ 2026.09.20
+	_async_task = params->getBoolean("async");
 
 	_disable_tick = params->getBoolean("disabletick");
 	_disable_min1 = params->getBoolean("disablemin1");
 	_disable_min5 = params->getBoolean("disablemin5");
 	_disable_day = params->getBoolean("disableday");
+
+	/*
+	 *	秒线默认关闭，必须显式打开，和 WtDataWriter 的语义一致
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	_enable_sec5 = params->getBoolean("enablesec5");
+	if (_enable_sec5)
+	{
+		std::string codes = params->getCString("sec5_codes");
+		if (!codes.empty())
+		{
+			const StringVector& ay = StrUtil::split(codes, ",");
+			for (const std::string& code : ay)
+			{
+				std::string c = StrUtil::trim(code.c_str());
+				if (!c.empty())
+					_sec5_codes.insert(c);
+			}
+		}
+
+		if (_sec5_codes.empty())
+			pipe_writer_log(sink, LL_WARN, "sec5 bars enabled for ALL contracts, expect roughly 12x the volume of min1 bars");
+		else
+			pipe_writer_log(sink, LL_INFO, "sec5 bars enabled for {} contract(s)", _sec5_codes.size());
+	}
 
 	if (params->has("tickmapsize"))
 		_tick_mapsize = params->getUInt32("tickmapsize");
@@ -193,6 +233,52 @@ void WtDataWriterAD::loadCache()
 				const BarCacheItem& item = _m1_cache._cache_block->_items[i];
 				std::string key = fmtutil::format<64>("{}.{}", item._exchg, item._code);
 				_m1_cache._idx[key] = i;
+			}
+		}
+	}
+
+	/*
+	 *	秒线缓存
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	只在启用秒线时才映射这个文件，避免不用秒线的部署凭空多一个缓存文件
+	 */
+	if (_enable_sec5 && _s5_cache.empty())
+	{
+		bool bNew = false;
+		std::string filename = _base_dir + _s5_cache._filename;
+		if (!StdFile::exists(filename.c_str()))
+		{
+			uint64_t uSize = sizeof(RTBarCache) + sizeof(BarCacheItem) * CACHE_SIZE_STEP_AD;
+			BoostFile bf;
+			bf.create_new_file(filename.c_str());
+			bf.truncate_file((uint32_t)uSize);
+			bf.close_file();
+			bNew = true;
+		}
+
+		_s5_cache._file_ptr.reset(new BoostMappingFile);
+		_s5_cache._file_ptr->map(filename.c_str());
+		_s5_cache._cache_block = (RTBarCache*)_s5_cache._file_ptr->addr();
+
+		_s5_cache._cache_block->_size = min(_s5_cache._cache_block->_size, _s5_cache._cache_block->_capacity);
+
+		if (bNew)
+		{
+			memset(_s5_cache._cache_block, 0, _s5_cache._file_ptr->size());
+
+			_s5_cache._cache_block->_capacity = CACHE_SIZE_STEP_AD;
+			_s5_cache._cache_block->_type = BT_RT_Cache;
+			_s5_cache._cache_block->_size = 0;
+			_s5_cache._cache_block->_version = 1;
+			strcpy(_s5_cache._cache_block->_blk_flag, BLK_FLAG);
+		}
+		else
+		{
+			for (uint32_t i = 0; i < _s5_cache._cache_block->_size; i++)
+			{
+				const BarCacheItem& item = _s5_cache._cache_block->_items[i];
+				std::string key = fmtutil::format<64>("{}.{}", item._exchg, item._code);
+				_s5_cache._idx[key] = i;
 			}
 		}
 	}
@@ -387,11 +473,22 @@ void WtDataWriterAD::pushTask(TaskInfo task)
 	if(_task_thrd == NULL)
 	{
 		_task_thrd.reset(new StdThread([this](){
-			while (!_terminated)
+			/*
+			 *	By 秒K线支持 @ 2026.09.20
+			 *	循环条件带上 !_tasks.empty()：
+			 *	release() 是先置 _terminated 再 notify+join，
+			 *	原先的 while(!_terminated) 会让线程立刻退出，
+			 *	队列里没处理完的任务(可能是收盘前最后一批K线)直接丢掉。
+			 *	现在要把队列排空才退出
+			 */
+			while (!_terminated || !_tasks.empty())
 			{
 				if(_tasks.empty())
 				{
 					StdUniqueLock lck(_task_mtx);
+					//已经在收尾了就别再等了，避免 join 卡住
+					if (_terminated)
+						break;
 					_task_cond.wait(_task_mtx);
 					continue;
 				}
@@ -542,6 +639,46 @@ void WtDataWriterAD::pipeToM5Bars(WTSContractInfo* ct, const WTSBarStruct& bar)
 		if (!bSucc)
 		{
 			pipe_writer_log(_sink, LL_ERROR, "pipe m5 bar @ {} of {} via extended dumper {} failed", bar.time, ct->getFullCode(), id);
+		}
+	}
+}
+
+/*
+ *	秒线落库
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	和 pipeToM1Bars/pipeToM5Bars 的区别只在key：
+ *	秒线的时间戳是 yyyyMMddHHmmss(约2e13)，必须用 LMDBSecBarKey(uint64)，
+ *	截断进 LMDBBarKey 的 uint32 会丢高位
+ */
+void WtDataWriterAD::pipeToSec5Bars(WTSContractInfo* ct, const WTSBarStruct& bar)
+{
+	WtLMDBPtr db = get_k_db(ct->getExchg(), KP_Sec5);
+	if (db)
+	{
+		LMDBSecBarKey key(ct->getExchg(), ct->getCode(), bar.time);
+		WtLMDBQuery query(*db);
+		if (!query.put_and_commit((void*)&key, sizeof(key), (void*)&bar, sizeof(WTSBarStruct)))
+		{
+			pipe_writer_log(_sink, LL_ERROR, "pipe sec5 bar @ {} of {} to db failed", bar.time, ct->getFullCode());
+		}
+		else
+		{
+			pipe_writer_log(_sink, LL_DEBUG, "sec5 bar @ {} of {} piped to db", bar.time, ct->getFullCode());
+		}
+	}
+
+	for (auto& item : _dumpers)
+	{
+		const char* id = item.first.c_str();
+		IHisDataDumper* dumper = item.second;
+		if (dumper == NULL)
+			continue;
+
+		bool bSucc = dumper->dumpHisBars(ct->getFullCode(), "s5", (WTSBarStruct*)&bar, 1);
+		if (!bSucc)
+		{
+			pipe_writer_log(_sink, LL_ERROR, "pipe sec5 bar @ {} of {} via extended dumper {} failed", bar.time, ct->getFullCode(), id);
 		}
 	}
 }
@@ -837,6 +974,100 @@ void WtDataWriterAD::updateBarCache(WTSContractInfo* ct, WTSTickData* curTick)
 			newBar->add += curTick->additional();
 		}
 	}
+
+	/*
+	 *	更新5秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	结构与上面的m1/m5段一致，差别在时间戳的算法：
+	 *	分钟线用 timeToMinutes/minuteToTime + timeToMinBar，
+	 *	秒线用 timeToSeconds/secondsToTime + timeToSecBar(yyyyMMddHHmmss)。
+	 *	不能复用上面算好的 minutes，秒线要的是秒级精度
+	 */
+	if (_enable_sec5 && _s5_cache._cache_block)
+	{
+		//白名单不命中就跳过
+		if (!_sec5_codes.empty() && _sec5_codes.find(ct->getFullCode()) == _sec5_codes.end())
+			return;
+
+		uint32_t curSecTime = curTick->actiontime() / 1000;	//HHMMSS
+		uint32_t seconds = sInfo->timeToSeconds(curSecTime);
+		if (seconds == INVALID_UINT32)
+			return;
+
+		StdUniqueLock lock(_s5_cache._mtx);
+		uint32_t idx = 0;
+		bool bNewCode = false;
+		if (_s5_cache._idx.find(key) == _s5_cache._idx.end())
+		{
+			idx = _s5_cache._cache_block->_size;
+			_s5_cache._idx[key] = _s5_cache._cache_block->_size;
+			_s5_cache._cache_block->_size += 1;
+			if (_s5_cache._cache_block->_size >= _s5_cache._cache_block->_capacity)
+			{
+				_s5_cache._cache_block = (RTBarCache*)resizeRTBlock<RTBarCache, BarCacheItem>(_s5_cache._file_ptr, _s5_cache._cache_block->_capacity + CACHE_SIZE_STEP_AD);
+				pipe_writer_log(_sink, LL_INFO, "sec5 cache resized to {} items", _s5_cache._cache_block->_capacity);
+			}
+			bNewCode = true;
+		}
+		else
+		{
+			idx = _s5_cache._idx[key];
+		}
+
+		BarCacheItem& item = (BarCacheItem&)_s5_cache._cache_block->_items[idx];
+		if (bNewCode)
+		{
+			strcpy(item._exchg, curTick->exchg());
+			strcpy(item._code, curTick->code());
+		}
+		WTSBarStruct* lastBar = &item._bar;
+
+		//拼接5秒线
+		uint32_t barSecs = (seconds / 5) * 5 + 5;
+		uint32_t secTime = sInfo->secondsToTime(barSecs);
+		uint32_t barDate = uDate;
+		if (secTime < curSecTime)
+		{
+			//bar的收盘时刻小于tick时刻，说明跨日了
+			barDate = TimeUtils::getNextDate(barDate);
+		}
+		uint64_t barTime = TimeUtils::timeToSecBar(barDate, secTime);
+
+		bool bNewBar = (barTime > lastBar->time);
+
+		WTSBarStruct* newBar = lastBar;
+		if (bNewBar)
+		{
+			//新bar意味着上一根已闭合，先把它写进库
+			if (!bNewCode)
+				pipeToSec5Bars(ct, *lastBar);
+
+			newBar->date = curTick->tradingdate();
+			newBar->time = barTime;
+			newBar->open = curTick->price();
+			newBar->high = curTick->price();
+			newBar->low = curTick->price();
+			newBar->close = curTick->price();
+
+			newBar->vol = curTick->volume();
+			newBar->money = curTick->turnover();
+			newBar->hold = curTick->openinterest();
+			newBar->add = curTick->additional();
+		}
+		else if (barTime == lastBar->time)
+		{
+			//只有时间戳完全相同才累积，倒序的tick直接丢弃
+			newBar->close = curTick->price();
+			newBar->high = max(curTick->price(), newBar->high);
+			newBar->low = min(curTick->price(), newBar->low);
+
+			newBar->vol += curTick->volume();
+			newBar->money += curTick->turnover();
+			newBar->hold = curTick->openinterest();
+			newBar->add += curTick->additional();
+		}
+	}
 }
 
 WTSTickData* WtDataWriterAD::getCurTick(const char* code, const char* exchg/* = ""*/)
@@ -1032,12 +1263,27 @@ WtDataWriterAD::WtLMDBPtr WtDataWriterAD::get_k_db(const char* exchg, WTSKlinePe
 		the_map = &_exchg_d1_dbs;
 		subdir = "day";
 	}
+	//By 秒K线支持 @ 2026.09.20
+	else if (period == KP_Sec5)
+	{
+		the_map = &_exchg_s5_dbs;
+		subdir = "sec5";
+	}
 	else
 		return std::move(WtLMDBPtr());
 
 	auto it = the_map->find(exchg);
 	if (it != the_map->end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(false));
 	std::string path = fmtutil::format("{}{}/{}/", _base_dir.c_str(), subdir.c_str(), exchg);
@@ -1057,7 +1303,16 @@ WtDataWriterAD::WtLMDBPtr WtDataWriterAD::get_t_db(const char* exchg, const char
 	std::string key = fmtutil::format<64>("{}.{}", exchg, code);
 	auto it = _tick_dbs.find(key);
 	if (it != _tick_dbs.end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(false));
 	std::string path = fmtutil::format("{}ticks/{}/{}", _base_dir.c_str(), exchg, code);

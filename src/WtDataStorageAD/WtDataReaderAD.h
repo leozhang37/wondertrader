@@ -98,7 +98,12 @@ private:
 	/*
 	 *	从LMDB中更新缓存的数据
 	 */
-	void	update_cache_from_lmdb(BarsList& barsList, const char* exchg, const char* code, WTSKlinePeriod period, uint32_t& lastBarTime);
+	/*
+	 *	@lastBarTime	改成uint64：秒线的bar时间戳是 yyyyMMddHHmmss(约2e13)，
+	 *					uint32装不下
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	void	update_cache_from_lmdb(BarsList& barsList, const char* exchg, const char* code, WTSKlinePeriod period, uint64_t& lastBarTime);
 
 	std::string	read_bars_to_buffer(const char* exchg, const char* code, WTSKlinePeriod period);
 
@@ -116,6 +121,8 @@ private:
 
 	WtLMDBMap	_exchg_m1_dbs;
 	WtLMDBMap	_exchg_m5_dbs;
+	//By 秒K线支持 @ 2026.09.20
+	WtLMDBMap	_exchg_s5_dbs;
 	WtLMDBMap	_exchg_d1_dbs;
 
 	//用exchg.code作为key，如BINANCE.BTCUSDT

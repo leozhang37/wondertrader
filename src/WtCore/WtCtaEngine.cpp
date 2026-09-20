@@ -33,6 +33,7 @@ namespace rj = rapidjson;
 
 WtCtaEngine::WtCtaEngine()
 	: _tm_ticker(NULL)
+	, _last_periodic_time(0)
 {
 	
 }
@@ -42,6 +43,16 @@ WtCtaEngine::~WtCtaEngine()
 {
 	if (_tm_ticker)
 	{
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里必须先stop再delete。
+		 *	原先直接delete，而WtCtaRtTicker的析构是空的、_thrd是
+		 *	shared_ptr<std::thread>，析构时线程仍处于joinable状态，
+		 *	会直接触发std::terminate。
+		 *	实盘中引擎与进程同寿，走不到这一步所以一直没暴露。
+		 *	和WtDataWriter的_proc_chk是同一类问题
+		 */
+		_tm_ticker->stop();
 		delete _tm_ticker;
 		_tm_ticker = NULL;
 	}
@@ -393,19 +404,35 @@ void WtCtaEngine::on_schedule(uint32_t curDate, uint32_t curTime)
 		}
 	}
 
-	push_task([this](){
-		update_fund_dynprofit();
-		/*
-		 *	By Wesley @ 2023.01.30
-		 *	增加一个定时刷新交易账号资金的入口
-		 */
-		_adapter_mgr->refresh_funds();
-	});
+	/*
+	 *	定期刷新与落盘做节流
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	目标仓位的下发(commit_cached_targets)不能节流，它是交易语义的一部分；
+	 *	但资金刷新和组合数据落盘是定期性质的，60秒一次足够
+	 */
+	const uint64_t PERIODIC_INTERVAL_MS = 60 * 1000;
+	uint64_t nowMs = TimeUtils::getLocalTimeNow();
+	bool bPeriodic = (_last_periodic_time == 0 || nowMs - _last_periodic_time >= PERIODIC_INTERVAL_MS);
+	if (bPeriodic)
+		_last_periodic_time = nowMs;
+
+	if (bPeriodic)
+	{
+		push_task([this](){
+			update_fund_dynprofit();
+			/*
+			 *	By Wesley @ 2023.01.30
+			 *	增加一个定时刷新交易账号资金的入口
+			 */
+			_adapter_mgr->refresh_funds();
+		});
+	}
 
 	//_exec_mgr.set_positions(target_pos);
 	_exec_mgr.commit_cached_targets(bRiskEnabled ? _risk_volscale : 1);
 
-	save_datas();
+	if (bPeriodic)
+		save_datas();
 
 	if (_evt_listener)
 		_evt_listener->on_schedule_event(curDate, curTime);

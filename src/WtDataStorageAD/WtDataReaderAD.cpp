@@ -214,16 +214,33 @@ std::string WtDataReaderAD::read_bars_to_buffer(const char* exchg, const char* c
 
 	std::string buffer;
 	WtLMDBQuery query(*db);
-	LMDBBarKey lKey(exchg, code, 0);
-	LMDBBarKey rKey(exchg, code, 0xffffffff);
-	query.get_range(std::string((const char*)&lKey, sizeof(lKey)),
-		std::string((const char*)&lKey, sizeof(lKey)), [this, &buffer](const ValueArray& ayKeys, const ValueArray& ayVals) {
+
+	auto onRead = [this, &buffer](const ValueArray& ayKeys, const ValueArray& ayVals) {
 		if (ayVals.empty())
 			return;
 
 		buffer.resize(sizeof(WTSBarStruct)*ayVals.size());
 		memcpy((void*)buffer.data(), ayVals.data(), sizeof(WTSBarStruct)*ayVals.size());
-	});
+	};
+
+	/*
+	 *	秒线的key是uint64的 LMDBSecBarKey，不能用 LMDBBarKey
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	if (period == KP_Sec5)
+	{
+		LMDBSecBarKey lKey(exchg, code, 0);
+		LMDBSecBarKey rKey(exchg, code, 0xFFFFFFFFFFFFFFFFULL);
+		query.get_range(std::string((const char*)&lKey, sizeof(lKey)),
+			std::string((const char*)&rKey, sizeof(rKey)), onRead);
+	}
+	else
+	{
+		LMDBBarKey lKey(exchg, code, 0);
+		LMDBBarKey rKey(exchg, code, 0xffffffff);
+		query.get_range(std::string((const char*)&lKey, sizeof(lKey)),
+			std::string((const char*)&rKey, sizeof(rKey)), onRead);
+	}
 	return std::move(buffer);
 }
 
@@ -244,10 +261,29 @@ bool WtDataReaderAD::cacheBarsFromStorage(const std::string& key, const char* st
 		return false;
 
 	WtLMDBQuery query(*db);
-	LMDBBarKey rKey(cInfo._exchg, cInfo._code, 0xffffffff);
-	LMDBBarKey lKey(cInfo._exchg, cInfo._code, 0);
-	int cnt = query.get_lowers(std::string((const char*)&lKey, sizeof(lKey)), std::string((const char*)&rKey, sizeof(rKey)),
-		count, [this, &barList, &lKey](const ValueArray& ayKeys, const ValueArray& ayVals) {
+
+	/*
+	 *	秒线用uint64的key
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	std::string sLKey, sRKey;
+	if (period == KP_Sec5)
+	{
+		LMDBSecBarKey lKey(cInfo._exchg, cInfo._code, 0);
+		LMDBSecBarKey rKey(cInfo._exchg, cInfo._code, 0xFFFFFFFFFFFFFFFFULL);
+		sLKey.assign((const char*)&lKey, sizeof(lKey));
+		sRKey.assign((const char*)&rKey, sizeof(rKey));
+	}
+	else
+	{
+		LMDBBarKey lKey(cInfo._exchg, cInfo._code, 0);
+		LMDBBarKey rKey(cInfo._exchg, cInfo._code, 0xffffffff);
+		sLKey.assign((const char*)&lKey, sizeof(lKey));
+		sRKey.assign((const char*)&rKey, sizeof(rKey));
+	}
+
+	int cnt = query.get_lowers(sLKey, sRKey,
+		count, [this, &barList, &sLKey](const ValueArray& ayKeys, const ValueArray& ayVals) {
 		if (ayVals.empty())
 			return;
 
@@ -255,7 +291,7 @@ bool WtDataReaderAD::cacheBarsFromStorage(const std::string& key, const char* st
 		for (std::size_t i = 0; i < cnt; i++)
 		{
 			//要检查左边界
-			if(memcmp(ayKeys[i].data(), (void*)&lKey, sizeof(lKey)) < 0)
+			if(memcmp(ayKeys[i].data(), sLKey.data(), sLKey.size()) < 0)
 				continue;
 
 			barList._bars.push_back(*(WTSBarStruct*)ayVals[i].data());
@@ -266,14 +302,38 @@ bool WtDataReaderAD::cacheBarsFromStorage(const std::string& key, const char* st
 	return true;
 }
 
-void WtDataReaderAD::update_cache_from_lmdb(BarsList& barsList, const char* exchg, const char* code, WTSKlinePeriod period, uint32_t& lastBarTime)
+void WtDataReaderAD::update_cache_from_lmdb(BarsList& barsList, const char* exchg, const char* code, WTSKlinePeriod period, uint64_t& lastBarTime)
 {
 	bool isDay = (period == KP_DAY);
+	//By 秒K线支持 @ 2026.09.20
+	bool isSec = (period == KP_Sec5);
 	WtLMDBPtr db = get_k_db(exchg, period);
+	if (db == NULL)
+		return;
+
 	WtLMDBQuery query(*db);
-	LMDBBarKey lKey(exchg, code, lastBarTime);
-	LMDBBarKey rKey(exchg, code, 0xFFFFFFFF);
-	int cnt = query.get_uppers(std::string((const char*)&lKey, sizeof(lKey)), std::string((const char*)&rKey, sizeof(rKey)), 
+
+	/*
+	 *	秒线用uint64的key，其余沿用uint32
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	std::string sLKey, sRKey;
+	if (isSec)
+	{
+		LMDBSecBarKey lKey(exchg, code, lastBarTime);
+		LMDBSecBarKey rKey(exchg, code, 0xFFFFFFFFFFFFFFFFULL);
+		sLKey.assign((const char*)&lKey, sizeof(lKey));
+		sRKey.assign((const char*)&rKey, sizeof(rKey));
+	}
+	else
+	{
+		LMDBBarKey lKey(exchg, code, (uint32_t)lastBarTime);
+		LMDBBarKey rKey(exchg, code, 0xFFFFFFFF);
+		sLKey.assign((const char*)&lKey, sizeof(lKey));
+		sRKey.assign((const char*)&rKey, sizeof(rKey));
+	}
+
+	int cnt = query.get_uppers(sLKey, sRKey,
 		9999, [this, &barsList, isDay, &lastBarTime](const ValueArray& ayKeys, const ValueArray& ayVals) {
 
 		std::size_t cnt = ayVals.size();
@@ -292,7 +352,9 @@ void WtDataReaderAD::update_cache_from_lmdb(BarsList& barsList, const char* exch
 			else
 			{
 				barsList._bars.push_back(*curBar);
-				lastBarTime = (uint32_t)curBarTime;
+				//不再截断成uint32，秒线的时间戳放不进去
+				//By 秒K线支持 @ 2026.09.20
+				lastBarTime = curBarTime;
 				_sink->on_bar(barsList._code.c_str(), barsList._period, &barsList._bars.back());
 			}
 		}
@@ -423,19 +485,37 @@ WTSKlineSlice* WtDataReaderAD::readKlineSlice(const char* stdCode, WTSKlinePerio
 	count = min((uint32_t)barsList._bars.size(), count);
 
 	bool isDay = (period == KP_DAY);
-	etime = isDay ? curDate : ((curDate - 19900000)*10000 + curTime);
+	//By 秒K线支持 @ 2026.09.20
+	bool isSec = (period == KP_Sec5);
+	/*
+	 *	这里的 etime 要和 bar.time 同一种编码才能比较：
+	 *	日线用date，分钟线用(date-19900000)*10000+HHMM，
+	 *	秒线是 yyyyMMddHHmmss。
+	 *	原先只有前两种，秒线会因为量级差5个数量级而永远判成"已是最新"，
+	 *	不去LMDB取增量
+	 */
+	if (isSec)
+		etime = TimeUtils::timeToSecBar(curDate, curTime * 100 + (curSecs / 1000) % 100);
+	else if (isDay)
+		etime = curDate;
+	else
+		etime = (curDate - 19900000)*10000 + curTime;
 	if(barsList._last_req_time < etime)
 	{
 		//上次请求的时间，小于当前请求的时间，则要检查最后一条K线
 		WTSBarStruct& lastBar = barsList._bars.back();
-		uint32_t lastBarTime = isDay ? lastBar.date : (uint32_t)lastBar.time;
+		//秒线的时间戳要用uint64承载
+		//By 秒K线支持 @ 2026.09.20
+		uint64_t lastBarTime = isDay ? (uint64_t)lastBar.date : lastBar.time;
 		if(lastBarTime < etime)
 		{
 			//如果最后一条K线的时间小于当前时间，先从数LMDB更新最新的K线
 			update_cache_from_lmdb(barsList, cInfo._exchg, curCode.c_str(), period, lastBarTime);
 
 			lastBar = barsList._bars.back();
-			lastBarTime = isDay ? lastBar.date : (uint32_t)lastBar.time;
+			//不能截断成uint32，秒线的时间戳放不进去
+			//By 秒K线支持 @ 2026.09.20
+			lastBarTime = isDay ? (uint64_t)lastBar.date : lastBar.time;
 		}
 
 		//从lmdb读完了以后，再检查
@@ -508,7 +588,7 @@ void WtDataReaderAD::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDa
 		CodeHelper::CodeInfo cInfo = CodeHelper::extractStdCode(barsList._code.c_str(), _hot_mgr);
 		if (barsList._period != KP_DAY)
 		{
-			uint32_t lastBarTime = (uint32_t)barsList._bars.back().time;
+			uint64_t lastBarTime = barsList._bars.back().time;
 			pipe_reader_log(_sink, LL_DEBUG,
 				"Updating {} bars of {} in section ({},{}]", PERIOD_NAME[barsList._period], barsList._code, lastBarTime, endBarTime);
 			update_cache_from_lmdb(barsList, barsList._exchg.c_str(), cInfo._code, barsList._period, lastBarTime);
@@ -527,7 +607,7 @@ void WtDataReaderAD::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDa
 		}
 		else if(endTDate != 0)
 		{
-			uint32_t lastBarTime = barsList._bars.back().date;
+			uint64_t lastBarTime = barsList._bars.back().date;
 			endBarTime = uDate;
 			update_cache_from_lmdb(barsList, barsList._exchg.c_str(), cInfo._code, barsList._period, lastBarTime);
 			if (lastBarTime < endBarTime)
@@ -570,12 +650,27 @@ WtDataReaderAD::WtLMDBPtr WtDataReaderAD::get_k_db(const char* exchg, WTSKlinePe
 		the_map = &_exchg_d1_dbs;
 		subdir = "day";
 	}
+	//By 秒K线支持 @ 2026.09.20
+	else if (period == KP_Sec5)
+	{
+		the_map = &_exchg_s5_dbs;
+		subdir = "sec5";
+	}
 	else
 		return std::move(WtLMDBPtr());
 
 	auto it = the_map->find(exchg);
 	if (it != the_map->end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(true));
 	std::string path = fmtutil::format("{}{}/{}/", _base_dir.c_str(), subdir.c_str(), exchg);
@@ -599,7 +694,16 @@ WtDataReaderAD::WtLMDBPtr WtDataReaderAD::get_t_db(const char* exchg, const char
 	std::string key = fmtutil::format<64>("{}.{}", exchg, code);
 	auto it = _tick_dbs.find(key);
 	if (it != _tick_dbs.end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(true));
 	std::string path = fmtutil::format("{}ticks/{}/{}", _base_dir.c_str(), exchg, code);

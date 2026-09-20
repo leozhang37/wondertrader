@@ -4,6 +4,7 @@
 #include "../Share/TimeUtils.hpp"
 #include "../Share/CodeHelper.hpp"
 #include "../Share/StdUtils.hpp"
+#include "../Share/BoostFile.hpp"
 
 #include "../Includes/WTSContractInfo.hpp"
 #include "../Includes/IBaseDataMgr.h"
@@ -138,6 +139,7 @@ bool proc_block_data(std::string& content, bool isBar, bool bKeepHead /* = true 
 
 WtDataReader::WtDataReader()
 	: _last_time(0)
+	, _last_sec_time(0)
 	, _base_data_mgr(NULL)
 	, _hot_mgr(NULL)
 {
@@ -944,6 +946,7 @@ bool WtDataReader::cacheFinalBarsFromLoader(void* codeInfo, const std::string& k
 	{
 	case KP_Minute1: pname = "m1"; break;
 	case KP_Minute5: pname = "m5"; break;
+	case KP_Sec5: pname = "s5"; break;
 	case KP_DAY: pname = "d"; break;
 	default: pname = ""; break;
 	}
@@ -980,6 +983,7 @@ bool WtDataReader::cacheIntegratedBars(void* codeInfo, const std::string& key, c
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1298,6 +1302,7 @@ bool WtDataReader::cacheAdjustedStkBars(void* codeInfo, const std::string& key, 
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1561,7 +1566,79 @@ bool WtDataReader::cacheAdjustedStkBars(void* codeInfo, const std::string& key, 
 	return true;
 }
 
-bool WtDataReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period)
+/*
+ *	读取未压缩历史文件尾部的若干条K线
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	秒线的his文件是 BLOCK_VERSION_RAW_V2(未压缩)，头部12字节之后就是裸的
+ *	WTSBarStruct 数组，因此可以直接seek到尾部只读需要的部分，
+ *	不必像压缩文件那样整体解压。返回实际读到的条数
+ */
+uint32_t WtDataReader::readTailBarsFromRawFile(const char* filename, uint32_t tailCount, std::vector<WTSBarStruct>& bars)
+{
+	BoostFile f;
+	if (!f.open_existing_file(filename, boost::interprocess::read_only))
+	{
+		pipe_reader_log(_sink, LL_DEBUG, "Tail read of {} skipped: cannot open file", filename);
+		return 0;
+	}
+
+	BlockHeader hdr;
+	if (!f.read_file(&hdr, sizeof(BlockHeader)))
+	{
+		pipe_reader_log(_sink, LL_DEBUG, "Tail read of {} skipped: cannot read header", filename);
+		f.close_file();
+		return 0;
+	}
+
+	//压缩的或者老版本结构体都没法尾部定位，交给调用方走全量路径
+	if (hdr.is_compressed() || hdr.is_old_version())
+	{
+		pipe_reader_log(_sink, LL_DEBUG, "Tail read of {} skipped: file is compressed or old version", filename);
+		f.close_file();
+		return 0;
+	}
+
+	f.seek_to_end(0);
+	uint64_t fsize = f.get_file_pointer();
+	if (fsize < BLOCK_HEADER_SIZE)
+	{
+		f.close_file();
+		return 0;
+	}
+
+	uint64_t payload = fsize - BLOCK_HEADER_SIZE;
+	uint32_t total = (uint32_t)(payload / sizeof(WTSBarStruct));
+	if (total == 0)
+	{
+		f.close_file();
+		return 0;
+	}
+
+	uint32_t toRead = (tailCount == 0 || tailCount > total) ? total : tailCount;
+	uint64_t offset = BLOCK_HEADER_SIZE + (uint64_t)(total - toRead) * sizeof(WTSBarStruct);
+
+	//这里不能用seek_to_begin，它的参数是int，大文件会溢出
+	if (!f.set_file_pointer((boost::interprocess::offset_t)offset, boost::interprocess::file_begin))
+	{
+		f.close_file();
+		return 0;
+	}
+
+	bars.resize(toRead);
+	bool bSucc = f.read_file(bars.data(), sizeof(WTSBarStruct) * toRead);
+	f.close_file();
+
+	if (!bSucc)
+	{
+		bars.clear();
+		return 0;
+	}
+
+	return toRead;
+}
+
+bool WtDataReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period, uint32_t tailCount /* = 0 */)
 {
 	CodeHelper::CodeInfo* cInfo = (CodeHelper::CodeInfo*)codeInfo;
 	WTSCommodityInfo* commInfo = _base_data_mgr->getCommodity(cInfo->_exchg, cInfo->_product);
@@ -1577,6 +1654,7 @@ bool WtDataReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key, 
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1663,6 +1741,25 @@ bool WtDataReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key, 
 
 		if (bHit)
 		{
+			/*
+			 *	By 秒K线支持 @ 2026.09.20
+			 *	指定了尾部条数时，先试着只读文件末尾。
+			 *	对秒线这种动辄几百MB的文件，这一步能把读取量从整个文件
+			 *	降到实际需要的几十KB。文件是压缩的则返回0，自动退回下面的全量路径
+			 */
+			if (tailCount > 0)
+			{
+				std::vector<WTSBarStruct> tailBars;
+				uint32_t got = readTailBarsFromRawFile(filename.c_str(), tailCount, tailBars);
+				if (got > 0)
+				{
+					barList._bars.swap(tailBars);
+					barList._his_tail = tailCount;
+					pipe_reader_log(_sink, LL_INFO, "{} items of back {} data of {} cached from tail", got, pname.c_str(), stdCode);
+					return true;
+				}
+			}
+
 			//如果有格式化的历史数据文件, 则直接读取
 			std::string content;
 			StdFile::read_file_content(filename.c_str(), content);
@@ -1724,6 +1821,13 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 
 	thread_local static char key[64] = { 0 };
 	fmtutil::format_to(key, "{}#{}", stdCode, period);
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线的历史文件很大，不能像分钟线那样整文件读进内存，
+	 *	所以只加载尾部。这里留一倍余量，避免策略每多请求一点就要重读文件
+	 */
+	uint32_t tailCount = (period == KP_Sec5) ? (count * 2 + 16) : 0;
+
 	auto it = _bars_cache.find(key);
 	bool bHasHisData = false;
 	if (it == _bars_cache.end())
@@ -1736,11 +1840,23 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 		bHasHisData = cacheFinalBarsFromLoader(&cInfo, key, stdCode, period);
 
 		if(!bHasHisData)
-			bHasHisData = cacheHisBarsFromFile(&cInfo, key, stdCode, period);
+			bHasHisData = cacheHisBarsFromFile(&cInfo, key, stdCode, period, tailCount);
 	}
 	else
 	{
 		bHasHisData = true;
+
+		/*
+		 *	秒线之前只按尾部加载过，如果这次要的条数超出了已缓存的量，
+		 *	就从文件里重新多读一些
+		 */
+		BarsList& cached = (BarsList&)it->second;
+		if (period == KP_Sec5 && cached._his_tail != 0
+			&& count > cached._bars.size() && cached._bars.size() >= cached._his_tail)
+		{
+			pipe_reader_log(_sink, LL_DEBUG, "Reloading sec5 bars of {}, {} cached but {} requested", stdCode, cached._bars.size(), count);
+			bHasHisData = cacheHisBarsFromFile(&cInfo, key, stdCode, period, tailCount);
+		}
 	}
 
 	if(!bHasHisData)
@@ -1748,20 +1864,44 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 		pipe_reader_log(_sink, LL_DEBUG, "No {} bars of {} loaded", PERIOD_NAME[period], stdCode);
 	}
 
-	uint32_t curDate, curTime;
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	秒线的etime是yyyyMMddHHmmss，分钟线是yyyyMMddHHmm，两者精度不同要分开处理。
+	 *	get_min_time()只给到分钟，秒线要再拼上get_secs()（毫秒精度，取整秒）
+	 */
+	bool isSec = (period == KP_Sec5);
+	uint32_t curDate, curTime;	//curTime：秒线为HHMMSS，其他为HHMM
 	if (etime == 0)
 	{
 		curDate = _sink->get_date();
-		curTime = _sink->get_min_time();
-		etime = (uint64_t)curDate * 10000 + curTime;
+		if (isSec)
+		{
+			curTime = _sink->get_min_time() * 100 + (_sink->get_secs() / 1000) % 100;
+			etime = TimeUtils::timeToSecBar(curDate, curTime);
+		}
+		else
+		{
+			curTime = _sink->get_min_time();
+			etime = (uint64_t)curDate * 10000 + curTime;
+		}
 	}
 	else
 	{
-		curDate = (uint32_t)(etime / 10000);
-		curTime = (uint32_t)(etime % 10000);
+		if (isSec)
+		{
+			curDate = TimeUtils::secBarToDate(etime);
+			curTime = TimeUtils::secBarToTime(etime);
+		}
+		else
+		{
+			curDate = (uint32_t)(etime / 10000);
+			curTime = (uint32_t)(etime % 10000);
+		}
 	}
 
-	uint32_t endTDate = _base_data_mgr->calcTradingDate(stdPID, curDate, curTime, false);
+	//calcTradingDate只认HHMM，秒线要把秒去掉
+	uint32_t curMinOfDay = isSec ? (curTime / 100) : curTime;
+	uint32_t endTDate = _base_data_mgr->calcTradingDate(stdPID, curDate, curMinOfDay, false);
 	uint32_t curTDate = _base_data_mgr->calcTradingDate(stdPID, 0, 0, false);
 
 	BarsList& barsList = _bars_cache[key];
@@ -1775,6 +1915,7 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -1800,7 +1941,13 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 	{
 		WTSBarStruct bar;
 		bar.date = curDate;
-		bar.time = (curDate - 19900000) * 10000 + curTime;
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这个bar只是用来在rt块里做lower_bound定位当前时刻的，
+		 *	时间戳编码必须和块里的bar一致，否则会定位到当天最早或最晚
+		 */
+		bar.time = isSec ? TimeUtils::timeToSecBar(curDate, curTime)
+						 : ((uint64_t)(curDate - 19900000) * 10000 + curTime);
 
 		const char* curCode = barsList._raw_code.c_str();
 
@@ -1909,8 +2056,18 @@ WTSKlineSlice* WtDataReader::readKlineSlice(const char* stdCode, WTSKlinePeriod 
 		rtCnt = 0;
 		hisCnt = count;
 		hisCnt = min(hisCnt, (uint32_t)barsList._bars.size());
-		head = &barsList._bars[barsList._bars.size() - hisCnt];
-		slice->appendBlock(head, hisCnt);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先没有 hisCnt != 0 的判断，而上面 bHasToday 的两个分支都有。
+		 *	历史数据为空时 &_bars[0] 是对空vector取地址，属于未定义行为，
+		 *	Release下会直接段错误(Debug下往往看不出来)。
+		 *	无历史数据是完全正常的情形(新合约、新装的环境)，所以要补上
+		 */
+		if (hisCnt != 0)
+		{
+			head = &barsList._bars[barsList._bars.size() - hisCnt];
+			slice->appendBlock(head, hisCnt);
+		}
 	}
 
 	pipe_reader_log(_sink, LL_DEBUG, "His {} bars of {} loaded, {} from history, {} from realtime", PERIOD_NAME[period], stdCode, hisCnt, rtCnt);
@@ -2131,7 +2288,7 @@ WtDataReader::TransBlockPair* WtDataReader::getRTTransBlock(const char* exchg, c
 
 WtDataReader::RTKlineBlockPair* WtDataReader::getRTKilneBlock(const char* exchg, const char* code, WTSKlinePeriod period)
 {
-	if (period != KP_Minute1 && period != KP_Minute5)
+	if (period != KP_Minute1 && period != KP_Minute5 && period != KP_Sec5)
 		return NULL;
 
 	thread_local static char key[64] = { 0 };
@@ -2151,6 +2308,11 @@ WtDataReader::RTKlineBlockPair* WtDataReader::getRTKilneBlock(const char* exchg,
 		cache_map = &_rt_min5_map;
 		subdir = "min5";
 		bType = BT_RT_Minute5;
+		break;
+	case KP_Sec5:
+		cache_map = &_rt_sec5_map;
+		subdir = "sec5";
+		bType = BT_RT_Sec5;
 		break;
 	default: break;
 	}
@@ -2207,6 +2369,76 @@ WtDataReader::RTKlineBlockPair* WtDataReader::getRTKilneBlock(const char* exchg,
 	return &block;
 }
 
+/*
+ *	秒线闭合处理
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	和onMinuteEnd的结构一致，区别在于：
+ *	1、只处理_period为KP_Sec5的缓存项，分钟线由onMinuteEnd负责
+ *	2、时间戳比较用秒编码(yyyyMMddHHmmss)
+ *	3、不碰_last_time：秒线和分钟线是两条独立的推进轴，
+ *	   共用一个游标会互相把对方的闭合事件吃掉
+ */
+void WtDataReader::onSecondEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate /* = 0 */)
+{
+	uint64_t nowTime = TimeUtils::timeToSecBar(uDate, uTime);
+	if (nowTime <= _last_sec_time)
+		return;
+
+	for (auto it = _bars_cache.begin(); it != _bars_cache.end(); it++)
+	{
+		BarsList& barsList = (BarsList&)it->second;
+		if (barsList._period != KP_Sec5)
+			continue;
+
+		if (barsList._raw_code.empty())
+			continue;
+
+		RTKlineBlockPair* kBlk = getRTKilneBlock(barsList._exchg.c_str(), barsList._raw_code.c_str(), barsList._period);
+		if (kBlk == NULL)
+			continue;
+
+		//确定上一次已读取过的实时K线条数
+		uint32_t preCnt = (barsList._rt_cursor == UINT_MAX) ? 0 : barsList._rt_cursor + 1;
+
+		for (;;)
+		{
+			if (kBlk->_block->_size <= preCnt)
+				break;
+
+			WTSBarStruct& nextBar = kBlk->_block->_bars[preCnt];
+			if (nextBar.time > nowTime)
+				break;
+
+			if (barsList._factor == DBL_MAX)
+			{
+				_sink->on_bar(barsList._code.c_str(), barsList._period, &nextBar);
+			}
+			else
+			{
+				WTSBarStruct cpBar = nextBar;
+				cpBar.open *= barsList._factor;
+				cpBar.high *= barsList._factor;
+				cpBar.low *= barsList._factor;
+				cpBar.close *= barsList._factor;
+
+				barsList._bars.emplace_back(cpBar);
+				_sink->on_bar(barsList._code.c_str(), barsList._period, &barsList._bars[barsList._bars.size() - 1]);
+			}
+
+			preCnt++;
+		}
+
+		if (preCnt > 0)
+			barsList._rt_cursor = preCnt - 1;
+	}
+
+	if (_sink)
+		_sink->on_all_bar_updated(uTime);
+
+	_last_sec_time = nowTime;
+}
+
 void WtDataReader::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate /* = 0 */)
 {
 	//这里应该触发检查
@@ -2217,6 +2449,12 @@ void WtDataReader::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 	for (auto it = _bars_cache.begin(); it != _bars_cache.end(); it++)
 	{
 		BarsList& barsList = (BarsList&)it->second;
+
+		//秒线由onSecondEnd负责，这里跳过，否则两条推进轴会互相干扰
+		//By 秒K线支持 @ 2026.09.20
+		if (barsList._period == KP_Sec5)
+			continue;
+
 		if (barsList._period != KP_DAY)
 		{
 			if (!barsList._raw_code.empty())

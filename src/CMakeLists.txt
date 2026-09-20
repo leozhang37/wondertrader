@@ -160,4 +160,6 @@ ADD_SUBDIRECTORY(TestPorter)
 ADD_SUBDIRECTORY(TestTrader)
 ADD_SUBDIRECTORY(TestParser)
 ADD_SUBDIRECTORY(TestUnits)
+# 回测的单测独立成一个可执行文件，见 TestBtUnits/CMakeLists.txt 里的说明
+ADD_SUBDIRECTORY(TestBtUnits)
 

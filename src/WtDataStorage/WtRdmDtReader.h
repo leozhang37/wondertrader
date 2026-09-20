@@ -222,10 +222,15 @@ private:
 	 */
 	bool		cacheHisBarsFromFile(void* codeInfo, const std::string& key, const char* stdCode, WTSKlinePeriod period);
 
-	uint32_t		readBarsFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, std::vector<WTSBarStruct>& ayBars, bool isDay = false);
-	WTSBarStruct*	indexBarFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, uint32_t& count, bool isDay = false);
+	uint32_t		readBarsFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, std::vector<WTSBarStruct>& ayBars, bool isDay = false, bool isSec = false);
+	/*
+	 *	@isSec	是否秒线。秒线的bar时间戳编码和分钟线不同，
+	 *			定位边界时要分开处理
+	 *	By 秒K线支持 @ 2026.09.20
+	 */
+	WTSBarStruct*	indexBarFromCacheByRange(const std::string& key, uint64_t stime, uint64_t etime, uint32_t& count, bool isDay = false, bool isSec = false);
 
-	WTSBarStruct*	indexBarFromCacheByCount(const std::string& key, uint64_t etime, uint32_t& count, bool isDay = false);
+	WTSBarStruct*	indexBarFromCacheByCount(const std::string& key, uint64_t etime, uint32_t& count, bool isDay = false, bool isSec = false);
 
 	bool	loadStkAdjFactorsFromFile(const char* adjfile);
 	

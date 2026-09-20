@@ -74,6 +74,22 @@ class IDataWriter
 public:
 	IDataWriter():_sink(NULL){}
 
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	这个虚析构原先是缺的，而导出的 deleteWriter 里是
+	 *	    delete writer;   // writer 的静态类型是 IDataWriter*
+	 *	通过没有虚析构的基类指针 delete 派生类对象属于未定义行为：
+	 *	WtDataWriter 的那些 map/shared_ptr/queue 成员不会被析构，
+	 *	而且 delete 拿到的对象大小也是错的，在 libc++ 下会直接触发陷阱。
+	 *	IDataReader/IBtDtReader/IRdmDtReader/IParserApi/ITraderApi
+	 *	都有虚析构，只有这个漏了。
+	 *	WtDtCore/DataManager 在收尾时就会调 deleteWriter，属于可达路径。
+	 *
+	 *	注意这会在 IDataWriter 的虚表里多出一个slot，
+	 *	所有实现类和调用方都要一起重新编译
+	 */
+	virtual ~IDataWriter(){}
+
 	virtual bool init(WTSVariant* params, IDataWriterSink* sink) { _sink = sink; return true; }
 
 	virtual void release() = 0;

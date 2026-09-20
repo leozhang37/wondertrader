@@ -170,6 +170,19 @@ public:
 	virtual void onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate = 0) = 0;
 
 	/*
+	 *	@brief	秒线闭合事件处理接口
+	 *	By 秒K线支持 @ 2026.09.20
+	 *
+	 *	@param uDate	闭合的秒线日期,如20260920,这里不是交易日
+	 *	@param uTime	闭合的秒线时间,格式HHMMSS,如093005
+	 *	@param endTDate	如果是交易日最后一条,则为当前交易日,其他情况为0
+	 *
+	 *	这里带默认空实现而不是纯虚，是为了不破坏已有数据存储插件的兼容性：
+	 *	不支持秒线的存储引擎不必改动即可继续编译和加载
+	 */
+	virtual void onSecondEnd(uint32_t uDate, uint32_t uTime, uint32_t endTDate = 0) {}
+
+	/*
 	 *	@brief	读取tick数据切片
 	 *	@details 切片不会复制数据,只把缓存中的数据指针传递出来,所以叫做切片
 	 *

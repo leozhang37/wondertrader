@@ -61,6 +61,7 @@ CtaStraBaseCtx::CtaStraBaseCtx(WtCtaEngine* engine, const char* name, int32_t sl
 	, _total_calc_time(0)
 	, _emit_times(0)
 	, _last_cond_min(0)
+	, _last_save_time(0)
 	, _is_in_schedule(false)
 	, _ud_modified(false)
 	, _last_barno(0)
@@ -499,6 +500,10 @@ void CtaStraBaseCtx::load_data(uint32_t flag /* = 0xFFFFFFFF */)
 
 void CtaStraBaseCtx::save_data(uint32_t flag /* = 0xFFFFFFFF */)
 {
+	//任何一次落盘都重置计时，on_schedule那次只在距上次够久时才补
+	//By 秒K线支持 @ 2026.09.20
+	_last_save_time = TimeUtils::getLocalTimeNow();
+
 	rj::Document root(rj::kObjectType);
 
 	{//持仓数据保存
@@ -833,9 +838,14 @@ void CtaStraBaseCtx::on_tick(const char* stdCode, WTSTickData* newTick, bool bEm
 		if (it == _condtions.end())
 			return;
 
-		const CondList& condList = it->second;
-		for (const CondEntrust& entrust : condList)
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里改成非const，是为了触发后只删命中的那一条（见下面的erase）
+		 */
+		CondList& condList = (CondList&)it->second;
+		for (std::size_t ci = 0; ci < condList.size(); ci++)
 		{
+			const CondEntrust& entrust = condList[ci];
 			double curPrice = newTick->price();
 
 			bool isMatched = false;
@@ -921,9 +931,17 @@ void CtaStraBaseCtx::on_tick(const char* stdCode, WTSTickData* newTick, bool bEm
 				default: break;
 				}
 
-				//同一个bar设置针对同一个合约的条件单, 只可能触发一条
-				//所以这里直接清理掉即可
-				_condtions.erase(it);
+				/*
+				 *	By 秒K线支持 @ 2026.09.20
+				 *	原先这里是 _condtions.erase(it)，删的是该合约的整个CondList。
+				 *	注释说"同一个bar针对同一个合约只可能触发一条"，
+				 *	但如果策略同时挂了止损和止盈，触发其中一条会把另一条也删掉。
+				 *	秒线下重挂频率高12倍，撞上的概率显著增加，
+				 *	所以改成只删命中的那一条，其余的留着继续等
+				 */
+				condList.erase(condList.begin() + ci);
+				if (condList.empty())
+					_condtions.erase(it);
 				break;
 			}
 		}
@@ -943,8 +961,19 @@ bool CtaStraBaseCtx::on_schedule(uint32_t curDate, uint32_t curTime)
 {
 	_is_in_schedule = true;//开始调度, 修改标记
 
-	//主要用于保存浮动盈亏的
-	save_data();
+	/*
+	 *	主要用于保存浮动盈亏的
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	这里做了节流：分钟级下本来就是每分钟一次，
+	 *	秒线作主周期后如果每次调度都存，一天会多出十几倍的全量JSON序列化+写盘。
+	 *	按60秒间隔补一次即可，关键状态变更处仍然是立即保存的
+	 */
+	{
+		const uint64_t SAVE_INTERVAL_MS = 60 * 1000;
+		uint64_t now = TimeUtils::getLocalTimeNow();
+		if (_last_save_time == 0 || now - _last_save_time >= SAVE_INTERVAL_MS)
+			save_data();
+	}
 
 	bool isMainUdt = false;
 	bool emmited = false;
@@ -981,8 +1010,22 @@ bool CtaStraBaseCtx::on_schedule(uint32_t curDate, uint32_t curTime)
 			uint32_t offTime = sInfo->offsetTime(curTime, true);
 			if(offTime <= sInfo->getCloseTime(true))
 			{
-				_condtions.clear();
+				//By 秒K线支持 @ 2026.09.20
+				//原先这里是 _condtions.clear()，改成打标记，
+				//让策略重挂时能复用已有的条件单对象，避免清空窗口
+				mark_conditions_stale();
 				on_calculate(curDate, curTime);
+
+				/*
+				 *	补上实盘的on_calculate_done
+				 *	原先这个回调只有回测的CtaMocker会调，实盘从来不调，
+				 *	是个既有的不对称。顺手补齐，实盘/回测行为才一致
+				 */
+				on_calculate_done(curDate, curTime);
+
+				//清理策略这一轮没有重新挂上的条件单
+				sweep_stale_conditions();
+
 				log_debug("Strategy {} scheduled @ {}", _name, curTime);
 				emmited = true;
 
@@ -1003,7 +1046,15 @@ bool CtaStraBaseCtx::on_schedule(uint32_t curDate, uint32_t curTime)
 
 				if(!_condtions.empty())
 				{
-					_last_cond_min = (uint64_t)curDate * 10000 + curTime;
+					/*
+					 *	By 秒K线支持 @ 2026.09.20
+					 *	这里原来是 curDate*10000+curTime(分钟精度)。
+					 *	秒线的bar时间戳是yyyyMMddHHmmss，两者量级差5个数量级，
+					 *	stra_get_bars里的 lastBartime > _last_cond_min 判断会恒为真，
+					 *	导致每次重启恢复都把条件单误判成过期清掉。
+					 *	统一升到秒精度
+					 */
+					_last_cond_min = TimeUtils::timeToSecBar(curDate, curTime * 100 + (_engine->get_secs() / 1000) % 100);
 					save_data();
 				}
 			}
@@ -1119,6 +1170,69 @@ CondList& CtaStraBaseCtx::get_cond_entrusts(const char* stdCode)
 	return ce;
 }
 
+/*
+ *	条件单的 mark & sweep
+ *	By 秒K线支持 @ 2026.09.20
+ *
+ *	原先on_schedule里是无条件 _condtions.clear() 然后让策略在on_calculate里重挂。
+ *	这套"清空+重挂"本身是幂等的声明式设计，分钟级下没问题，
+ *	但秒线作主周期后每5秒清一次，暴露出两个问题：
+ *	1、clear到重挂之间_condtions是空的，此时并发进来的on_tick会漏检一次条件单。
+ *	   ticker的on_schedule受_mtx保护，但trigger_price(->on_tick)在锁外，
+ *	   而兜底线程和行情线程是两个线程，_condtions又是无锁的wt_hashmap，
+ *	   这个窗口被放大了12倍
+ *	2、每次都析构重建整张表，纯属浪费
+ *
+ *	改成打标记+清理后，幂等重挂的策略里条件单对象原地存活，
+ *	一次性挂单的策略行为和原来完全一致（仍会被清掉），
+ *	策略代码和接口签名都不用动
+ */
+void CtaStraBaseCtx::mark_conditions_stale()
+{
+	for (auto& m : _condtions)
+	{
+		for (CondEntrust& ce : m.second)
+			ce._stale = true;
+	}
+}
+
+void CtaStraBaseCtx::sweep_stale_conditions()
+{
+	for (auto it = _condtions.begin(); it != _condtions.end(); )
+	{
+		CondList& lst = (CondList&)it->second;
+
+		auto rm = std::remove_if(lst.begin(), lst.end(), [](const CondEntrust& ce) {
+			return ce._stale;
+		});
+		lst.erase(rm, lst.end());
+
+		if (lst.empty())
+			it = _condtions.erase(it);
+		else
+			it++;
+	}
+}
+
+void CtaStraBaseCtx::append_condition(const char* stdCode, const CondEntrust& entrust)
+{
+	CondList& condList = _condtions[stdCode];
+
+	//已经有等价的条件单，直接复用（清掉stale标记即可）
+	for (CondEntrust& ce : condList)
+	{
+		if (ce.same_as(entrust))
+		{
+			ce._stale = false;
+			return;
+		}
+	}
+
+	CondEntrust ne = entrust;
+	ne._stale = false;
+	condList.emplace_back(ne);
+}
+
 //////////////////////////////////////////////////////////////////////////
 //策略接口
 void CtaStraBaseCtx::stra_enter_long(const char* stdCode, double qty, const char* userTag /* = "" */, double limitprice, double stopprice)
@@ -1169,7 +1283,9 @@ void CtaStraBaseCtx::stra_enter_long(const char* stdCode, double qty, const char
 		
 		entrust._action = COND_ACTION_OL;
 
-		condList.emplace_back(entrust);
+		//走append_condition以便复用已存在的等价条件单
+		//By 秒K线支持 @ 2026.09.20
+		append_condition(stdCode, entrust);
 	}
 }
 
@@ -1227,7 +1343,9 @@ void CtaStraBaseCtx::stra_enter_short(const char* stdCode, double qty, const cha
 
 		entrust._action = COND_ACTION_OS;
 
-		condList.emplace_back(entrust);
+		//走append_condition以便复用已存在的等价条件单
+		//By 秒K线支持 @ 2026.09.20
+		append_condition(stdCode, entrust);
 	}
 }
 
@@ -1278,7 +1396,9 @@ void CtaStraBaseCtx::stra_exit_long(const char* stdCode, double qty, const char*
 
 		entrust._action = COND_ACTION_CL;
 
-		condList.emplace_back(entrust);
+		//走append_condition以便复用已存在的等价条件单
+		//By 秒K线支持 @ 2026.09.20
+		append_condition(stdCode, entrust);
 	}
 }
 
@@ -1330,7 +1450,9 @@ void CtaStraBaseCtx::stra_exit_short(const char* stdCode, double qty, const char
 
 		entrust._action = COND_ACTION_CS;
 		
-		condList.emplace_back(entrust);
+		//走append_condition以便复用已存在的等价条件单
+		//By 秒K线支持 @ 2026.09.20
+		append_condition(stdCode, entrust);
 	}
 }
 
@@ -1393,7 +1515,9 @@ void CtaStraBaseCtx::stra_set_position(const char* stdCode, double qty, const ch
 
 		entrust._action = COND_ACTION_SP;
 
-		condList.emplace_back(entrust);
+		//走append_condition以便复用已存在的等价条件单
+		//By 秒K线支持 @ 2026.09.20
+		append_condition(stdCode, entrust);
 	}
 }
 
@@ -1625,8 +1749,15 @@ WTSKlineSlice* CtaStraBaseCtx::stra_get_bars(const char* stdCode, const char* pe
 		{
 			//如果是第一次拉取主K线,则检查条件单触发时间
 			bool isDay = basePeriod[0] == 'd';
+			bool isSec = basePeriod[0] == 's';
 			uint64_t lastBartime = isDay ? kline->at(-1)->date : kline->at(-1)->time;
-			if(!isDay)
+			/*
+			 *	By 秒K线支持 @ 2026.09.20
+			 *	分钟线的bar时间是(date-19900000)*10000+HHMM，要补回199000000000
+			 *	才能和_last_cond_min比较；秒线本身就是yyyyMMddHHmmss，
+			 *	已经和升级后的_last_cond_min同一编码，不能再加偏移
+			 */
+			if(!isDay && !isSec)
 				lastBartime += 199000000000;
 
 			//如果最后一条已闭合的K线的时间大于条件单设置时间，说明条件单已经过期了，则需要清理

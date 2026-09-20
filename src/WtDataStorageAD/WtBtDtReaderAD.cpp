@@ -145,7 +145,16 @@ WtBtDtReaderAD::WtLMDBPtr WtBtDtReaderAD::get_k_db(const char* exchg, WTSKlinePe
 
 	auto it = the_map->find(exchg);
 	if (it != the_map->end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(true));
 	std::string path = fmtutil::format("{}{}/{}/", _base_dir.c_str(), subdir.c_str(), exchg);
@@ -171,7 +180,16 @@ WtBtDtReaderAD::WtLMDBPtr WtBtDtReaderAD::get_t_db(const char* exchg, const char
 	std::string key = fmtutil::format<64>("{}.{}", exchg, code);
 	auto it = _tick_dbs.find(key);
 	if (it != _tick_dbs.end())
-		return std::move(it->second);
+		/*
+		 *	By 秒K线支持 @ 2026.09.20
+		 *	这里原先是 return std::move(it->second)，
+		 *	把 map 里存的 shared_ptr 直接移走了：第2次调用取到值的同时
+		 *	把容器里的置空，第3次及以后 find 命中但拿到的是空指针，
+		 *	调用方 if(db) 为假就静默跳过——既不写库也不报错。
+		 *	实际表现是 AD 存储的K线从第3根开始全部丢失。
+		 *	shared_ptr 拷贝只是加一次引用计数，这里不该 move
+		 */
+		return it->second;
 
 	WtLMDBPtr dbPtr(new WtLMDB(true));
 	std::string path = fmtutil::format("{}ticks/{}/{}", _base_dir.c_str(), exchg, code);

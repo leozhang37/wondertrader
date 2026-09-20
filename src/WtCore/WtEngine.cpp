@@ -37,7 +37,21 @@ namespace rj = rapidjson;
 USING_NS_WTP;
 
 WtEngine::WtEngine()
-	: _port_fund(NULL)
+	/*
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	_cur_date 等几个时间成员原先没有出现在初始化列表里，
+	 *	而它们是裸的uint32_t，构造完就是未定义值。
+	 *	WtCtaRtTicker::run() 开头就用 get_date()/get_min_time() 去算交易日
+	 *	(那里的注释恰恰是"一定要在初始化之前把交易日确定下来")，
+	 *	拿到的其实是垃圾值；实盘里第一笔tick到来后会被set_date_time修正，
+	 *	所以一直没被发现，但在此之前任何依赖当前时间的读取都是错的
+	 */
+	: _cur_date(0)
+	, _cur_time(0)
+	, _cur_raw_time(0)
+	, _cur_secs(0)
+	, _cur_tdate(0)
+	, _port_fund(NULL)
 	, _risk_volscale(1.0)
 	, _risk_date(0)
 	, _terminated(false)
@@ -46,6 +60,7 @@ WtEngine::WtEngine()
 	, _notifier(NULL)
 	, _fund_udt_span(0)
 	, _ready(false)
+	, _has_sec_subs(false)
 {
 	TimeUtils::getDateTime(_cur_date, _cur_time);
 	_cur_secs = _cur_time % 100000;
@@ -280,6 +295,18 @@ WTSPortFundInfo* WtEngine::getFundInfo()
 	save_datas();
 
 	return _port_fund;
+}
+
+WtEngine::~WtEngine()
+{
+	//先置位再唤醒，让 task_loop 能跳出 while
+	_terminated = true;
+	if (_thrd_task)
+	{
+		_cond_task.notify_all();
+		_thrd_task->join();
+		_thrd_task = NULL;
+	}
 }
 
 void WtEngine::init(WTSVariant* cfg, IBaseDataMgr* bdMgr, WtDtMgr* dataMgr, IHotMgr* hotMgr, EventNotifier* notifier)
@@ -622,6 +649,27 @@ WTSKlineSlice* WtEngine::get_kline_slice(uint32_t sid, const char* stdCode, cons
 		}
 		else
 			kp = KP_Minute1;
+	}
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	KP_Sec5本身代表5秒，所以"s5"对应times=1走直读，
+	 *	"s10"/"s15"/"s30"/"s60"对应times=2/3/6/12走重采样。
+	 *	不是5的倍数的秒周期没有基础数据可用，这里直接拒绝
+	 */
+	else if (period[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		times /= 5;
+
+		//通知ticker要做秒级推进
+		_has_sec_subs = true;
 	}
 	else if (strcmp(period, "h") == 0)	//小时线
 	{
