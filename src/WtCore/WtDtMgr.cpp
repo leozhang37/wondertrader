@@ -162,6 +162,12 @@ void WtDtMgr::on_bar(const char* code, WTSKlinePeriod period, WTSBarStruct* newB
 		speriod = 'm';
 		times = 5;
 		break;
+	case KP_Sec5:
+		//KP_Sec5本身是5秒，所以基础周期对应"s5"
+		//By 秒K线支持 @ 2026.09.20
+		speriod = 's';
+		times = 5;
+		break;
 	default:
 		speriod = 'd';
 		times = 1;
@@ -413,6 +419,8 @@ constexpr inline const char* format_period(WTSKlinePeriod period)
 		return "half";
 	case KP_Hour:
 		return "hour";
+	case KP_Sec5:
+		return "sec5";
 	default:
 		return "unknown";
 	}

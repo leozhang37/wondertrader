@@ -18,6 +18,9 @@ file(GLOB SRCS *.cpp ./gtest/*.cc)
 LIST(APPEND SRCS ../WtDataStorage/WtDataWriter.cpp)
 LIST(APPEND SRCS ../WtDataStorage/WtDataReader.cpp)
 
+# 条件单结构体的等价判定是纯头文件逻辑，直接测
+INCLUDE_DIRECTORIES(../WtCore)
+
 SET(LIBS
     WTSTools
 	WTSUtils

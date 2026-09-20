@@ -15,6 +15,7 @@
 #include "../Share/BoostFile.hpp"
 #include "../Share/fmtlib.h"
 #include "../Share/SpinMutex.hpp"
+#include "../Share/decimal.h"
 
 #include <unordered_map>
 
@@ -43,10 +44,31 @@ typedef struct _CondEntrust
 	char			_code[MAX_INSTRUMENT_LENGTH];
 	char			_usertag[32];
 
+	/*
+	 *	陈旧标记
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	调度开始时把所有条件单打上stale，策略在on_calculate里重挂时，
+	 *	命中相同的单就复用并清掉标记，调度结束再清理仍带标记的。
+	 *	这样幂等重挂的策略里条件单对象能原地存活，
+	 *	既没有"清空到重挂"之间的空窗，也不用每次重建
+	 */
+	bool			_stale;
 
 	_CondEntrust()
 	{
 		memset(this, 0, sizeof(_CondEntrust));
+	}
+
+	//判断两个条件单是否等价（用于重挂时复用）
+	inline bool same_as(const _CondEntrust& o) const
+	{
+		return _field == o._field
+			&& _alg == o._alg
+			&& _action == o._action
+			&& decimal::eq(_target, o._target)
+			&& decimal::eq(_qty, o._qty)
+			&& strcmp(_code, o._code) == 0
+			&& strcmp(_usertag, o._usertag) == 0;
 	}
 
 } CondEntrust;
@@ -69,6 +91,17 @@ private:
 		double profit, double totalprofit = 0, const char* enterTag = "", const char* exitTag = "", uint32_t openBarNo = 0, uint32_t closeBarNo = 0);
 
 	void	save_data(uint32_t flag = 0xFFFFFFFF);
+
+	/*
+	 *	条件单的mark & sweep
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	替代原先on_schedule里的_condtions.clear()
+	 */
+	void	mark_conditions_stale();
+	void	sweep_stale_conditions();
+
+	//把一个条件单挂进去，已存在等价的就复用
+	void	append_condition(const char* stdCode, const CondEntrust& entrust);
 	void	load_data(uint32_t flag = 0xFFFFFFFF);
 
 	void	load_userdata();
@@ -317,6 +350,15 @@ protected:
 
 	CondEntrustMap	_condtions;
 	uint64_t		_last_cond_min;	//上次设置条件单的时间
+
+	/*
+	 *	上次落盘的本地时间(毫秒)
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	on_schedule开头那次save_data只是定期快照浮动盈亏，
+	 *	秒线作主周期后调度频率涨12倍，没必要每次都全量序列化一遍JSON。
+	 *	其余几处(条件单变化、下单成交、收盘)都是关键状态变更，仍然立即保存
+	 */
+	uint64_t		_last_save_time;
 	uint32_t		_last_barno;	//上次设置的K线编号
 
 	//是否处于调度中的标记

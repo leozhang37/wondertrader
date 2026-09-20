@@ -93,6 +93,15 @@ public:
 	inline uint32_t get_min_time() { return _cur_time; }
 	inline uint32_t get_raw_time() { return _cur_raw_time; }
 	inline uint32_t get_secs() { return _cur_secs; }
+
+	/*
+	 *	是否有策略订阅了秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	ticker据此决定要不要做秒级推进，没人订阅就不做，避免无谓开销。
+	 *	订阅发生在策略的on_init里，而ticker是在on_init之后才启动线程的，
+	 *	所以读这个标记的时机是安全的
+	 */
+	inline bool has_sec_subs() const { return _has_sec_subs; }
 	inline uint32_t get_trading_date() { return _cur_tdate; }
 
 	inline IBaseDataMgr*		get_basedata_mgr(){ return _base_data_mgr; }
@@ -332,5 +341,8 @@ protected:
 
 	//用于标记是否可以推送tickle
 	bool			_ready;
+	//有策略订阅了秒线
+	//By 秒K线支持 @ 2026.09.20
+	bool			_has_sec_subs;
 };
 NS_WTP_END

@@ -46,6 +46,7 @@ WtEngine::WtEngine()
 	, _notifier(NULL)
 	, _fund_udt_span(0)
 	, _ready(false)
+	, _has_sec_subs(false)
 {
 	TimeUtils::getDateTime(_cur_date, _cur_time);
 	_cur_secs = _cur_time % 100000;
@@ -622,6 +623,27 @@ WTSKlineSlice* WtEngine::get_kline_slice(uint32_t sid, const char* stdCode, cons
 		}
 		else
 			kp = KP_Minute1;
+	}
+	/*
+	 *	秒线
+	 *	By 秒K线支持 @ 2026.09.20
+	 *	KP_Sec5本身代表5秒，所以"s5"对应times=1走直读，
+	 *	"s10"/"s15"/"s30"/"s60"对应times=2/3/6/12走重采样。
+	 *	不是5的倍数的秒周期没有基础数据可用，这里直接拒绝
+	 */
+	else if (period[0] == 's')
+	{
+		if (times == 0 || times % 5 != 0)
+		{
+			WTSLogger::error("Unsupported second period: s{}, only multiples of 5 are available", times);
+			return NULL;
+		}
+
+		kp = KP_Sec5;
+		times /= 5;
+
+		//通知ticker要做秒级推进
+		_has_sec_subs = true;
 	}
 	else if (strcmp(period, "h") == 0)	//小时线
 	{
