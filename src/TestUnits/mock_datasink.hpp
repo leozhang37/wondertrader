@@ -32,6 +32,8 @@ public:
 	{
 		_commodity = WTSCommodityInfo::create(pid, pid, exchg, sInfo->id(), "CHINA");
 		_commodity->setSessionInfo(sInfo);
+		//和 WTSBaseDataMgr 一样把合约登记到品种上，WtDataWriter::transHisData 靠它枚举收盘作业的合约
+		_commodity->addCode(code);
 
 		_contract = WTSContractInfo::create(code, code, exchg, pid);
 		_contract->setCommInfo(_commodity);
@@ -54,7 +56,18 @@ public:
 	virtual WTSCommodityInfo* getCommodity(const char* exchgpid) override { return _commodity; }
 	virtual WTSCommodityInfo* getCommodity(const char* exchg, const char* pid) override { return _commodity; }
 
-	virtual WTSContractInfo* getContract(const char* code, const char* exchg = "", uint32_t uDate = 0) override { return _contract; }
+	/*
+	 *	只认自己的合约代码。原先是无条件返回，writer 收盘时处理队列里的 "MARK.<sid>" 标记项
+	 *	也会拿到合约，把tick按代码 "<sid>" 落成 his/ticks/.../<sid>.dsb
+	 */
+	virtual WTSContractInfo* getContract(const char* code, const char* exchg = "", uint32_t uDate = 0) override
+	{
+		if (_code != code)
+			return NULL;
+		if (exchg != NULL && strlen(exchg) > 0 && _exchg != exchg)
+			return NULL;
+		return _contract;
+	}
 	virtual WTSArray* getContracts(const char* exchg = "", uint32_t uDate = 0) override { return NULL; }
 
 	virtual WTSSessionInfo* getSession(const char* sid) override { return _sinfo; }

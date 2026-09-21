@@ -64,6 +64,26 @@ extern "C"
 
 	EXPORT_FLAG WtUInt32	resample_bars(WtString barFile, FuncGetBarsCallback cb, FuncCountDataCallback cbCnt, 
 		WtUInt64 fromTime, WtUInt64 endTime, WtString period, WtUInt32 times, WtString sessInfo, FuncLogCallback cbLogger = NULL, bool bAlignSec = false);
+
+	/*
+	 *	历史tick转5秒线
+	 *	By 历史tick转sec5 @ 2026.09.21
+	 *
+	 *	@tickFolder	his/ticks 根目录，目录结构为 <exchg>/<date>/<code>.dsb
+	 *	@outFolder	his/sec5 根目录，输出 <exchg>/<code>.dsb
+	 *	@commFile	品种配置文件(commodities.json)
+	 *	@sessFile	交易时间配置文件(sessions.json)
+	 *	@filter		合约或品种白名单，写法同 sec5_codes，如 DCE.jm,SHFE.rb2610，空表示全部
+	 *	@sDate		起始交易日(含)，0表示不限
+	 *	@eDate		截止交易日(含)，0表示不限
+	 *	@options	JSON，如 {"skip_notrade_tick":false,"skip_notrade_bar":false,"minbar_price_mode":0,"overwrite":false}
+	 *				前三项必须和datakit的配置一致，否则产出与实盘落盘的对不上；
+	 *				overwrite为false时，输出文件里已有的交易日保留原样，只补缺失的交易日
+	 *
+	 *	返回新写入的bar条数
+	 */
+	EXPORT_FLAG WtUInt32	trans_ticks_to_sec5(WtString tickFolder, WtString outFolder, WtString commFile, WtString sessFile,
+		WtString filter, WtUInt32 sDate, WtUInt32 eDate, WtString options, FuncLogCallback cbLogger = NULL);
 #ifdef __cplusplus
 }
 #endif

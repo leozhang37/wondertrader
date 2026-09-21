@@ -22,6 +22,7 @@ namespace fs = boost::filesystem;
 
 //By Wesley @ 2022.01.05
 #include "../Share/fmtlib.h"
+#include "SecBarBuilder.hpp"
 template<typename... Args>
 inline void pipe_writer_log(IDataWriterSink* sink, WTSLogLevel ll, const char* format, const Args&... args)
 {
@@ -1362,10 +1363,13 @@ void WtDataWriter::pipeToKlines(WTSContractInfo* ct, WTSTickData* curTick)
 		KBlockPair* pBlockPair = getKlineBlock(ct, KP_Sec5);
 		if (pBlockPair && pBlockPair->_block)
 		{
-			//tick的秒级时间戳，HHMMSS
-			uint32_t curSecTime = curTick->actiontime() / 1000;
-			uint32_t seconds = sInfo->timeToSeconds(curSecTime);
-			if (seconds != INVALID_UINT32)
+			/*
+			 *	By 历史tick转sec5 @ 2026.09.21
+			 *	拼接计算抽到了 SecBarBuilder.hpp，离线转换工具也用同一份，
+			 *	这里只保留rt块的加锁、扩容和计数
+			 */
+			const WTSTickStruct& ts = curTick->getTickStruct();
+			if (sec5::bar_time(ts, sInfo) != 0)
 			{
 				SpinLock lock(pBlockPair->_mutex);
 				RTKlineBlock* blk = pBlockPair->_block;
@@ -1376,90 +1380,21 @@ void WtDataWriter::pipeToKlines(WTSContractInfo* ct, WTSTickData* curTick)
 					blk = pBlockPair->_block;
 				}
 
-				WTSBarStruct* lastBar = NULL;
-				if (blk->_size > 0)
-				{
-					lastBar = &blk->_bars[blk->_size - 1];
-				}
+				WTSBarStruct* lastBar = (blk->_size > 0) ? &blk->_bars[blk->_size - 1] : NULL;
 
-				//拼接5秒线
-				uint32_t barSecs = (seconds / 5) * 5 + 5;
-				uint32_t barTime = sInfo->secondsToTime(barSecs);
-				uint32_t barDate = uDate;
-				if (barTime < curSecTime)
-				{
-					//bar的收盘时刻小于tick时刻，说明跨日了
-					barDate = TimeUtils::getNextDate(barDate);
-				}
-				uint64_t secBarTime = TimeUtils::timeToSecBar(barDate, barTime);
+				uint32_t limitFlag = 0;
+				if (curTick->isNewHigh())
+					limitFlag |= sec5::LF_NEW_HIGH;
+				if (curTick->isNewLow())
+					limitFlag |= sec5::LF_NEW_LOW;
 
-				bool bNew = false;
-				if (lastBar == NULL || secBarTime > lastBar->time)
-				{
-					bNew = true;
-				}
+				sec5::Options opt;
+				opt._skip_notrade_tick = _skip_notrade_tick;
+				opt._skip_notrade_bar = _skip_notrade_bar;
+				opt._min_price_mode = _min_price_mode;
 
-				WTSBarStruct* newBar = NULL;
-				if (bNew)
-				{
-					newBar = &blk->_bars[blk->_size];
+				if (sec5::update(ts, limitFlag, sInfo, opt, lastBar, &blk->_bars[blk->_size]) == sec5::UR_NEW)
 					blk->_size += 1;
-
-					newBar->date = curTick->tradingdate();
-					newBar->time = secBarTime;
-					newBar->open = curTick->price();
-					newBar->high = curTick->isNewHigh() ? curTick->high() : curTick->price();
-					newBar->low = curTick->isNewLow() ? curTick->low() : curTick->price();
-					newBar->close = curTick->price();
-
-					newBar->vol = curTick->volume();
-					newBar->money = curTick->turnover();
-
-					if (_min_price_mode == 1)
-					{
-						newBar->bid = curTick->bidprice(0);
-						newBar->ask = curTick->askprice(0);
-					}
-					else
-					{
-						newBar->hold = curTick->openinterest();
-						newBar->add = curTick->additional();
-					}
-				}
-				else if (secBarTime == lastBar->time && !(_skip_notrade_tick && tickNoTrade))
-				{
-					//只有时间戳完全相同才累积，时间倒序的tick直接丢弃，不能回写已闭合的bar
-					newBar = &blk->_bars[blk->_size - 1];
-
-					/*
-					 *	By Wesley @ 2023.07.05
-					 *	某些品种开盘时可能推送price为0的tick，会导致open和low都是0
-					 */
-					if (decimal::eq(newBar->open, 0))
-						newBar->open = curTick->price();
-
-					if (decimal::eq(newBar->low, 0))
-						newBar->low = curTick->isNewLow() ? curTick->low() : curTick->price();
-					else
-						newBar->low = curTick->isNewLow() ? curTick->low() : std::min(curTick->price(), newBar->low);
-
-					newBar->close = curTick->price();
-					newBar->high = curTick->isNewHigh() ? curTick->high() : std::max(curTick->price(), newBar->high);
-
-					newBar->vol += curTick->volume();
-					newBar->money += curTick->turnover();
-
-					if (_min_price_mode == 1)
-					{
-						newBar->bid = curTick->bidprice(0);
-						newBar->ask = curTick->askprice(0);
-					}
-					else
-					{
-						newBar->hold = curTick->openinterest();
-						newBar->add += curTick->additional();
-					}
-				}
 			}
 		}
 	}
@@ -1512,9 +1447,7 @@ WtDataWriter::KBlockPair* WtDataWriter::getKlineBlock(WTSContractInfo* ct, WTSKl
 		if (!_enable_sec5)
 			return NULL;
 		//白名单既可以写合约全代码(SHFE.rb2610)，也可以写品种(DCE.jm)覆盖该品种所有月份
-		if (!_sec5_codes.empty()
-			&& _sec5_codes.find(ct->getFullCode()) == _sec5_codes.end()
-			&& _sec5_codes.find(ct->getFullPid()) == _sec5_codes.end())
+		if (!sec5::code_match(_sec5_codes, ct->getFullCode(), ct->getFullPid()))
 			return NULL;
 		cache_map = &_rt_sec5_blocks;
 		subdir = "sec5";

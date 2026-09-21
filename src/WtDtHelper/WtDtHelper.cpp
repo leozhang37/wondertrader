@@ -22,6 +22,16 @@
 
 #include "../Includes/WTSDataDef.hpp"
 #include "../Includes/WTSSessionInfo.hpp"
+#include "../Includes/WTSContractInfo.hpp"
+#include "../Share/CodeHelper.hpp"
+#include "../Share/decimal.h"
+#include "../WTSTools/WTSBaseDataMgr.h"
+#include "../WtDataStorage/SecBarBuilder.hpp"
+
+#include <set>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 #include <boost/filesystem.hpp>
 namespace fs = boost::filesystem;
@@ -1244,4 +1254,392 @@ bool store_transactions(WtString tickFile, WTSTransStruct* firstItem, int count,
 		cbLogger("Write transactions to file succeedd");
 
 	return true;
+}
+
+/*
+ *	历史tick转5秒线
+ *	By 历史tick转sec5 @ 2026.09.21
+ *
+ *	拼接逻辑和实盘落盘共用 SecBarBuilder.hpp，这里只负责：
+ *	枚举tick文件、还原落盘时丢掉的新高/新低标记、按交易日合并、写出文件
+ */
+namespace
+{
+	inline void sec5_log(FuncLogCallback cbLogger, const std::string& msg)
+	{
+		if (cbLogger)
+			cbLogger(msg.c_str());
+	}
+
+	/*
+	 *	郑商所3位月份代码转4位，如 AP601 -> AP2601
+	 *	十位数按tick所在交易日推断，规则与 CodeHelper::rawMonthCodeToStdCode / CTPLoader 一致：
+	 *	合约年份个位 >= 当前年份个位 -> 当前十年，否则 -> 下一个十年
+	 */
+	std::string czce_full_code(const std::string& code, uint32_t tdate)
+	{
+		std::string pid = CodeHelper::rawMonthCodeToRawCommID(code.c_str());
+		std::string month = code.substr(pid.size());
+		if (month.size() != 3 || !std::all_of(month.begin(), month.end(), ::isdigit))
+			return code;
+
+		uint32_t curYear = tdate / 10000;
+		uint32_t curDecade = (curYear % 100) / 10;
+		uint32_t curUnit = curYear % 10;
+		uint32_t cUnit = month[0] - '0';
+		uint32_t decade = (cUnit >= curUnit) ? curDecade : (curDecade + 1) % 10;
+
+		return pid + (char)('0' + decade) + month;
+	}
+
+	bool load_sec5_file(const std::string& filename, std::vector<WTSBarStruct>& bars)
+	{
+		if (!StdFile::exists(filename.c_str()))
+			return false;
+
+		std::string content;
+		StdFile::read_file_content(filename.c_str(), content);
+		if (content.size() < BLOCK_HEADER_SIZE)
+			return false;
+
+		if (!proc_block_data(content, true, false))
+			return false;
+
+		const WTSBarStruct* first = (const WTSBarStruct*)content.data();
+		bars.assign(first, first + content.size() / sizeof(WTSBarStruct));
+		return true;
+	}
+
+	/*
+	 *	写sec5历史文件，格式与 WtDataWriter 收盘转存的一致：
+	 *	12字节的 BlockHeader + BT_HIS_Sec5 + 未压缩(读取侧要mmap和尾部定位)
+	 *	先写临时文件再rename，避免中途失败把已有的历史文件弄坏
+	 */
+	bool save_sec5_file(const std::string& filename, const std::vector<WTSBarStruct>& bars)
+	{
+		std::string tmpfile = filename + ".tmp";
+		{
+			BoostFile f;
+			if (!f.create_new_file(tmpfile.c_str()))
+				return false;
+
+			BlockHeader header;
+			memset(&header, 0, sizeof(header));
+			strcpy(header._blk_flag, BLK_FLAG);
+			header._type = BT_HIS_Sec5;
+			header._version = BLOCK_VERSION_RAW_V2;
+			f.write_file(&header, sizeof(header));
+			if (!bars.empty())
+				f.write_file(bars.data(), sizeof(WTSBarStruct)*bars.size());
+			f.close_file();
+		}
+
+		boost::system::error_code ec;
+		fs::rename(tmpfile, filename, ec);
+		if (ec)
+		{
+			fs::remove(tmpfile, ec);
+			return false;
+		}
+		return true;
+	}
+
+	/*
+	 *	把一个交易日的tick转成5秒线
+	 *	新高/新低标记不在落盘的tick里(它是 WTSTickData 的成员)，按 WtDataWriter::updateCache 的规则还原：
+	 *	交易日第一笔同时算新高和新低，之后和上一笔的当日累计高低价比较
+	 */
+	void ticks_to_sec5(const WTSTickStruct* ticks, std::size_t count, WTSSessionInfo* sInfo,
+		const sec5::Options& opt, std::vector<WTSBarStruct>& bars)
+	{
+		const WTSTickStruct* prevTick = NULL;
+		for (std::size_t i = 0; i < count; i++)
+		{
+			const WTSTickStruct& curTick = ticks[i];
+
+			uint32_t limitFlag = 0;
+			if (prevTick == NULL)
+			{
+				limitFlag = sec5::LF_NEW_HIGH | sec5::LF_NEW_LOW;
+			}
+			else
+			{
+				if (decimal::gt(curTick.high, prevTick->high))
+					limitFlag |= sec5::LF_NEW_HIGH;
+				if (decimal::lt(curTick.low, prevTick->low))
+					limitFlag |= sec5::LF_NEW_LOW;
+			}
+			//不进K线的tick在实盘里也更新了缓存，所以这里要先更新 prevTick 再过滤
+			prevTick = &curTick;
+
+			if (!sec5::accept_tick(curTick, sInfo, opt._skip_notrade_bar))
+				continue;
+
+			WTSBarStruct newBar;
+			WTSBarStruct* lastBar = bars.empty() ? NULL : &bars.back();
+			if (sec5::update(curTick, limitFlag, sInfo, opt, lastBar, &newBar) == sec5::UR_NEW)
+				bars.emplace_back(newBar);
+		}
+	}
+
+	struct Sec5DayFile
+	{
+		std::string	_path;
+		bool		_is_alt;	//是否是郑商所3位代码的文件
+	};
+
+	struct Sec5Task
+	{
+		std::string	_exchg;
+		std::string	_code;		//输出用的代码，郑商所统一为4位
+		std::string	_pid;
+		std::set<std::string>	_alt_codes;	//出现过的郑商所3位代码
+		std::map<uint32_t, Sec5DayFile>	_days;
+	};
+}
+
+WtUInt32 trans_ticks_to_sec5(WtString tickFolder, WtString outFolder, WtString commFile, WtString sessFile,
+	WtString filter, WtUInt32 sDate, WtUInt32 eDate, WtString options, FuncLogCallback cbLogger /* = NULL */)
+{
+	//1、解析选项
+	sec5::Options opt;
+	bool bOverwrite = false;
+	if (options != NULL && strlen(options) > 0)
+	{
+		rj::Document root;
+		if (root.Parse(options).HasParseError() || !root.IsObject())
+		{
+			sec5_log(cbLogger, fmtutil::format(u8"选项解析失败: {}", options));
+			return 0;
+		}
+
+		if (root.HasMember("skip_notrade_tick"))
+			opt._skip_notrade_tick = root["skip_notrade_tick"].GetBool();
+		if (root.HasMember("skip_notrade_bar"))
+			opt._skip_notrade_bar = root["skip_notrade_bar"].GetBool();
+		if (root.HasMember("minbar_price_mode"))
+			opt._min_price_mode = root["minbar_price_mode"].GetUint();
+		if (root.HasMember("overwrite"))
+			bOverwrite = root["overwrite"].GetBool();
+	}
+
+	//2、加载交易时间和品种，不依赖 contracts.json：已到期的历史合约一般不在当前的合约表里
+	if (!StdFile::exists(sessFile) || !StdFile::exists(commFile))
+	{
+		sec5_log(cbLogger, fmtutil::format(u8"配置文件不存在: {} / {}", sessFile, commFile));
+		return 0;
+	}
+
+	WTSBaseDataMgr bdMgr;
+	if (!bdMgr.loadSessions(sessFile) || !bdMgr.loadCommodities(commFile))
+	{
+		sec5_log(cbLogger, u8"交易时间或品种配置加载失败");
+		return 0;
+	}
+
+	wt_hashset<std::string> codeFilter;
+	if (filter != NULL && strlen(filter) > 0)
+	{
+		for (const std::string& item : StrUtil::split(filter, ","))
+		{
+			std::string c = StrUtil::trim(item.c_str());
+			if (!c.empty())
+				codeFilter.insert(c);
+		}
+	}
+
+	std::string tickRoot = StrUtil::standardisePath(tickFolder);
+	std::string outRoot = StrUtil::standardisePath(outFolder);
+	if (!fs::exists(tickRoot))
+	{
+		sec5_log(cbLogger, fmtutil::format(u8"tick目录不存在: {}", tickRoot));
+		return 0;
+	}
+
+	//3、枚举 <exchg>/<date>/<code>.dsb，按合约归组
+	std::map<std::string, Sec5Task> tasks;
+	for (fs::directory_iterator eit(tickRoot); eit != fs::directory_iterator(); eit++)
+	{
+		if (!fs::is_directory(eit->path()))
+			continue;
+
+		std::string exchg = eit->path().filename().string();
+		for (fs::directory_iterator dit(eit->path()); dit != fs::directory_iterator(); dit++)
+		{
+			std::string dname = dit->path().filename().string();
+			if (!fs::is_directory(dit->path()) || dname.size() != 8 || !std::all_of(dname.begin(), dname.end(), ::isdigit))
+				continue;
+
+			uint32_t uDate = strtoul(dname.c_str(), NULL, 10);
+			if ((sDate != 0 && uDate < sDate) || (eDate != 0 && uDate > eDate))
+				continue;
+
+			for (fs::directory_iterator fit(dit->path()); fit != fs::directory_iterator(); fit++)
+			{
+				if (!fs::is_regular_file(fit->path()) || fit->path().extension().string() != ".dsb")
+					continue;
+
+				std::string rawCode = fit->path().stem().string();
+				std::string pid = CodeHelper::rawMonthCodeToRawCommID(rawCode.c_str());
+				//只处理分月合约，品种代码后面必须跟着月份
+				if (pid.empty() || pid.size() == rawCode.size())
+					continue;
+
+				std::string code = (exchg == "CZCE") ? czce_full_code(rawCode, uDate) : rawCode;
+				bool isAlt = (code != rawCode);
+
+				std::string fullCode = exchg + "." + code;
+				std::string fullPid = exchg + "." + pid;
+				bool bMatch = sec5::code_match(codeFilter, fullCode.c_str(), fullPid.c_str());
+				if (!bMatch && isAlt)
+					bMatch = codeFilter.find(exchg + "." + rawCode) != codeFilter.end();
+				if (!bMatch)
+					continue;
+
+				Sec5Task& task = tasks[fullCode];
+				task._exchg = exchg;
+				task._code = code;
+				task._pid = pid;
+				if (isAlt)
+					task._alt_codes.insert(rawCode);
+
+				auto it = task._days.find(uDate);
+				if (it != task._days.end())
+				{
+					//同一天新老代码的文件都有，以新代码的为准
+					if (isAlt)
+						continue;
+					sec5_log(cbLogger, fmtutil::format(u8"{} 在 {} 同时存在新老代码的tick文件，使用 {}", fullCode, uDate, fit->path().string()));
+				}
+				task._days[uDate] = { fit->path().string(), isAlt };
+			}
+		}
+	}
+
+	if (tasks.empty())
+	{
+		sec5_log(cbLogger, u8"没有找到符合条件的tick文件");
+		return 0;
+	}
+
+	//4、逐合约转换
+	WtUInt32 total = 0;
+	for (auto& item : tasks)
+	{
+		const std::string& fullCode = item.first;
+		Sec5Task& task = item.second;
+
+		WTSCommodityInfo* commInfo = bdMgr.getCommodity(task._exchg.c_str(), task._pid.c_str());
+		if (commInfo == NULL || commInfo->getSessionInfo() == NULL)
+		{
+			sec5_log(cbLogger, fmtutil::format(u8"品种 {}.{} 没有配置或没有交易时间，跳过 {}", task._exchg, task._pid, fullCode));
+			continue;
+		}
+		WTSSessionInfo* sInfo = commInfo->getSessionInfo();
+
+		std::string outDir = outRoot + task._exchg + "/";
+		fs::create_directories(outDir);
+		std::string filename = outDir + task._code + ".dsb";
+
+		//已有的数据：新代码文件优先，郑商所老代码文件里有而新文件里没有的交易日也并进来
+		std::vector<WTSBarStruct> oldBars;
+		load_sec5_file(filename, oldBars);
+
+		std::vector<std::string> altFiles;
+		for (const std::string& alt : task._alt_codes)
+		{
+			std::string altfile = outDir + alt + ".dsb";
+			std::vector<WTSBarStruct> altBars;
+			if (!load_sec5_file(altfile, altBars))
+				continue;
+
+			altFiles.emplace_back(altfile);
+			std::set<uint32_t> dates;
+			for (const WTSBarStruct& bar : oldBars)
+				dates.insert(bar.date);
+			for (const WTSBarStruct& bar : altBars)
+			{
+				if (dates.find(bar.date) == dates.end())
+					oldBars.emplace_back(bar);
+			}
+		}
+
+		std::set<uint32_t> oldDates;
+		for (const WTSBarStruct& bar : oldBars)
+			oldDates.insert(bar.date);
+
+		std::vector<WTSBarStruct> newBars;
+		std::set<uint32_t> doneDates;
+		uint32_t skipped = 0;
+		for (auto& day : task._days)
+		{
+			uint32_t uDate = day.first;
+			if (!bOverwrite && oldDates.find(uDate) != oldDates.end())
+			{
+				skipped++;
+				continue;
+			}
+
+			std::string content;
+			StdFile::read_file_content(day.second._path.c_str(), content);
+			if (content.size() < sizeof(HisTickBlock) || !proc_block_data(content, false, false))
+			{
+				sec5_log(cbLogger, fmtutil::format(u8"tick文件 {} 校验失败，跳过", day.second._path));
+				continue;
+			}
+
+			std::vector<WTSBarStruct> dayBars;
+			ticks_to_sec5((const WTSTickStruct*)content.data(), content.size() / sizeof(WTSTickStruct), sInfo, opt, dayBars);
+			newBars.insert(newBars.end(), dayBars.begin(), dayBars.end());
+			doneDates.insert(uDate);
+		}
+
+		if (doneDates.empty() && altFiles.empty())
+		{
+			sec5_log(cbLogger, fmtutil::format(u8"{} 没有需要转换的交易日(跳过已有的 {} 天)", fullCode, skipped));
+			continue;
+		}
+
+		//5、合并：去掉被覆盖的交易日，按时间排序，同一时间戳以新算的为准
+		std::vector<WTSBarStruct> allBars;
+		allBars.reserve(oldBars.size() + newBars.size());
+		for (const WTSBarStruct& bar : oldBars)
+		{
+			if (doneDates.find(bar.date) == doneDates.end())
+				allBars.emplace_back(bar);
+		}
+		allBars.insert(allBars.end(), newBars.begin(), newBars.end());
+		std::stable_sort(allBars.begin(), allBars.end(), [](const WTSBarStruct& a, const WTSBarStruct& b) {
+			return a.time < b.time;
+		});
+
+		std::vector<WTSBarStruct> finalBars;
+		finalBars.reserve(allBars.size());
+		for (const WTSBarStruct& bar : allBars)
+		{
+			if (!finalBars.empty() && finalBars.back().time == bar.time)
+				finalBars.back() = bar;
+			else
+				finalBars.emplace_back(bar);
+		}
+
+		if (!save_sec5_file(filename, finalBars))
+		{
+			sec5_log(cbLogger, fmtutil::format(u8"写入 {} 失败", filename));
+			continue;
+		}
+
+		//和 WtDataWriter 一样，郑商所老代码的文件并入新代码文件后就不再保留
+		for (const std::string& altfile : altFiles)
+		{
+			boost::system::error_code ec;
+			fs::remove(altfile, ec);
+		}
+
+		total += (WtUInt32)newBars.size();
+		sec5_log(cbLogger, fmtutil::format(u8"{} 转换完成：{} 个交易日，新增 {} 条5秒线，跳过已有的 {} 天，文件共 {} 条",
+			fullCode, doneDates.size(), newBars.size(), skipped, finalBars.size()));
+	}
+
+	return total;
 }
