@@ -21,11 +21,12 @@ file(GLOB SRCS *.cpp ./gtest/*.cc)
 INCLUDE_DIRECTORIES(../WtCore)
 
 SET(LIBS
+    # 秒级调度的集成测试要拉起真实的 WtCtaEngine，WtCore 是静态库可以直接链接；
+    # GNU ld 按顺序解析静态库，WtCore 依赖 WTSTools/WTSUtils，必须排在它们前面
+    WtCore
     WTSTools
 	WTSUtils
-    WtShareHelper
-    # 秒级调度的集成测试要拉起真实的 WtCtaEngine，WtCore 是静态库可以直接链接
-    WtCore)
+    WtShareHelper)
 IF (MSVC)
 ELSE(GNUCC)
     # WtDataWriter 依赖 boost_filesystem；
@@ -34,7 +35,7 @@ ELSE(GNUCC)
 ENDIF()
 IF (MSVC)
 ELSE(GNUCC)
-    LIST(APPEND LIBS pthread stdc++fs)
+    LIST(APPEND LIBS dl pthread stdc++fs)
     FIX_PLATFORM_LIBS(LIBS)
 	IF(WIN32)
 		LIST(APPEND LIBS iconv)
