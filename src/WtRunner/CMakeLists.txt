@@ -52,6 +52,7 @@ file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/parsers/)
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/traders/)
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/executer/)
 
+add_dependencies(WtRunner ParserUDP TraderMocker WtExeFact WtDataStorage WtDataStorageAD WtRiskMonFact WtMsgQue)
 add_custom_command(TARGET WtRunner POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserUDP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/
@@ -77,6 +78,7 @@ add_custom_command(TARGET WtRunner POST_BUILD
 	COMMENT "depends modules copied")
 
 IF(NOT APPLE)
+add_dependencies(WtRunner TraderCTP TraderXTP TraderCTPMini TraderCTPOpt TraderFemas)
 add_custom_command(TARGET WtRunner POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}TraderCTP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/traders/

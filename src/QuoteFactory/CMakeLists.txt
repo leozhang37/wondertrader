@@ -49,6 +49,7 @@ ELSE (GNUCC)
 ENDIF ()
 
 file(MAKE_DIRECTORY ${EXECUTABLE_OUTPUT_PATH}/parsers/)
+add_dependencies(QuoteFactory WtDataStorage)
 add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}WtDataStorage${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/
@@ -56,6 +57,7 @@ add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMENT "depends modules copied")
 
 IF(NOT APPLE)
+add_dependencies(QuoteFactory ParserCTP ParserXTP ParserFemas ParserCTPMini)
 add_custom_command(TARGET QuoteFactory POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E
 	copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTP${SUFFIX} ${EXECUTABLE_OUTPUT_PATH}/parsers/

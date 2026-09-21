@@ -51,6 +51,7 @@ ELSE (GNUCC)
 ENDIF ()
 
 file(MAKE_DIRECTORY ${LIBRARY_OUTPUT_PATH}/parsers/)
+add_dependencies(WtDtPorter WtDataStorage WtDataStorageAD)
 add_custom_command(TARGET WtDtPorter POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E
 		copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}WtDataStorage${SUFFIX} ${LIBRARY_OUTPUT_PATH}/
@@ -61,6 +62,7 @@ add_custom_command(TARGET WtDtPorter POST_BUILD
 		COMMENT "depends modules copied")
 
 IF(NOT APPLE)
+add_dependencies(WtDtPorter ParserCTP ParserXTP ParserFemas ParserCTPMini ParserCTPOpt)
 add_custom_command(TARGET WtDtPorter POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E
 		copy ${CMAKE_BINARY_DIR}/build_${PLATFORM}/${CMAKE_BUILD_TYPE}/bin/${PREFIX}ParserCTP${SUFFIX} ${LIBRARY_OUTPUT_PATH}/parsers/
