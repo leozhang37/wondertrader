@@ -216,7 +216,7 @@ private:
 	 *	老配置升级上来会在无感知的情况下数据量暴增，所以必须默认关闭。
 	 */
 	bool			_enable_sec5;
-	//为空表示不限制合约（仍需 _enable_sec5 为 true），非空则只对表内合约落秒线
+	//为空表示不限制合约（仍需 _enable_sec5 为 true），非空则只对表内合约或品种落秒线
 	wt_hashset<std::string>	_sec5_codes;
 
 	bool			_disable_trans;

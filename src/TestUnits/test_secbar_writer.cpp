@@ -252,6 +252,80 @@ TEST(test_secbar_writer, whitelist_hit_writes_bars)
 }
 
 /*
+ *	白名单按品种：写 TEST.rb 要覆盖 rb 的所有月份，
+ *	写别的品种或品种前缀(TEST.r)都不能误命中
+ */
+namespace
+{
+	//按给定白名单喂10秒tick，返回是否生成了 rt/sec5 文件
+	bool run_whitelist(const char* tag, const char* codes, std::vector<WTSBarStruct>& bars)
+	{
+		WTSSessionInfo* sInfo = make_sess();
+		MockBaseDataMgr bd(EXCHG, PID, CODE, sInfo);
+		std::string dir = temp_root(tag);
+		MockWriterSink sink(&bd, TDATE);
+
+		IDataWriter* pw = storage_loader::make_writer();
+		if (pw == nullptr)
+		{
+			ADD_FAILURE() << "cannot load WtDataStorage, is WT_TEST_LIBDIR set?";
+			sInfo->release();
+			return false;
+		}
+
+		WTSVariant* cfg = make_cfg(dir, true, codes);
+		EXPECT_TRUE(pw->init(cfg, &sink));
+
+		for (int i = 0; i < 10; i++)
+		{
+			WTSTickStruct ts = tick_maker::make(CODE, TDATE, TDATE, 90000 + i, 100.0);
+			WTSTickData* tick = WTSTickData::create(ts);
+			tick->setContractInfo(bd.contract());
+			pw->writeTick(tick, 0);
+			tick->release();
+		}
+
+		uint16_t blkType = 0;
+		bool ok = read_rt_bars(dir, bars, blkType);
+
+		pw->release();
+		storage_loader::free_writer(pw);
+		cfg->release();
+		sInfo->release();
+		fs::remove_all(dir);
+		return ok;
+	}
+}
+
+TEST(test_secbar_writer, whitelist_product_hit_writes_bars)
+{
+	std::vector<WTSBarStruct> bars;
+	ASSERT_TRUE(run_whitelist("wlp", "TEST.rb", bars)) << "product entry should cover all months";
+	EXPECT_EQ(bars.size(), 2u);
+}
+
+TEST(test_secbar_writer, whitelist_product_mixed_with_codes)
+{
+	//品种和合约混写，品种命中即可
+	std::vector<WTSBarStruct> bars;
+	ASSERT_TRUE(run_whitelist("wlp2", "TEST.hc2610, TEST.rb", bars));
+	EXPECT_EQ(bars.size(), 2u);
+}
+
+TEST(test_secbar_writer, whitelist_other_product_skipped)
+{
+	std::vector<WTSBarStruct> bars;
+	EXPECT_FALSE(run_whitelist("wlp3", "TEST.hc", bars)) << "other product must not match";
+}
+
+TEST(test_secbar_writer, whitelist_partial_product_skipped)
+{
+	//必须精确匹配品种，不能按前缀匹配
+	std::vector<WTSBarStruct> bars;
+	EXPECT_FALSE(run_whitelist("wlp4", "TEST.r, rb, TEST.rb26", bars)) << "partial/exchange-less entries must not match";
+}
+
+/*
  *	小节边界：10:15:00 的tick要归第一小节最后一根，不能跨到第二小节
  */
 TEST(test_secbar_writer, section_end_tick_stays_in_section)

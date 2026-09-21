@@ -149,7 +149,8 @@ bool WtDataWriter::init(WTSVariant* params, IDataWriterSink* sink)
 	/*
 	 *	By 秒K线支持 @ 2026.09.20
 	 *	秒线默认关闭，必须显式打开，避免老配置升级后数据量无感知地涨12倍
-	 *	sec5_codes 是逗号分隔的合约全代码白名单(如 SHFE.rb2610)，留空表示不限合约
+	 *	sec5_codes 是逗号分隔的白名单，可以写合约全代码(如 SHFE.rb2610)，
+	 *	也可以写品种(如 DCE.jm，覆盖该品种所有月份)，留空表示不限合约
 	 */
 	_enable_sec5 = params->getBoolean("enablesec5");
 	if (_enable_sec5)
@@ -199,7 +200,7 @@ bool WtDataWriter::init(WTSVariant* params, IDataWriterSink* sink)
 		if (_sec5_codes.empty())
 			pipe_writer_log(sink, LL_WARN, "sec5 bars enabled for ALL contracts, expect roughly 12x the volume of min1 bars");
 		else
-			pipe_writer_log(sink, LL_INFO, "sec5 bars enabled for {} contract(s)", _sec5_codes.size());
+			pipe_writer_log(sink, LL_INFO, "sec5 bars enabled for {} whitelist entries (contract or product)", _sec5_codes.size());
 	}
 	return true;
 }
@@ -1510,7 +1511,10 @@ WtDataWriter::KBlockPair* WtDataWriter::getKlineBlock(WTSContractInfo* ct, WTSKl
 	case KP_Sec5:
 		if (!_enable_sec5)
 			return NULL;
-		if (!_sec5_codes.empty() && _sec5_codes.find(ct->getFullCode()) == _sec5_codes.end())
+		//白名单既可以写合约全代码(SHFE.rb2610)，也可以写品种(DCE.jm)覆盖该品种所有月份
+		if (!_sec5_codes.empty()
+			&& _sec5_codes.find(ct->getFullCode()) == _sec5_codes.end()
+			&& _sec5_codes.find(ct->getFullPid()) == _sec5_codes.end())
 			return NULL;
 		cache_map = &_rt_sec5_blocks;
 		subdir = "sec5";
