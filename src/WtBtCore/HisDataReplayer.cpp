@@ -4189,6 +4189,14 @@ bool HisDataReplayer::cacheIntegratedFutBarsFromBin(void* codeInfo, const std::s
 		std::size_t eIdx = pBar - firstBar;
 		if ((period == KP_DAY && pBar->date > eBar.date) || (period != KP_DAY && pBar->time > eBar.time))
 		{
+			/*
+			 *	By HOT复权越界修复 @ 2026.09.24
+			 *	该段内第一根bar已经晚于结束边界, 说明该段没有数据
+			 *	sIdx为0时eIdx--会下溢成极大值, 绕过下面的eIdx<sIdx判断, 复权时越界写内存
+			 */
+			if (eIdx == sIdx)
+				continue;
+
 			pBar--;
 			eIdx--;
 		}
