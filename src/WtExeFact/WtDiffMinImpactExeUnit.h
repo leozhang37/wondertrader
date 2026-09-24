@@ -96,7 +96,13 @@ public:
 private:
 	WTSTickData*	_last_tick;		//上一笔行情
 	double			_left_diff;		//未执行差量
-	StdUniqueMutex	_mtx_calc;
+	/*
+	 *	By 差量执行器线程安全 @ 2026.09.24
+	 *	on_tick(行情线程)、on_order/on_trade(交易回报线程)、set_position(引擎线程)会并发调用
+	 *	_last_tick 的替换和 _left_diff 的读写都要在该锁内进行, 否则 do_calc 可能用到已被释放的 tick
+	 *	改成递归锁, 防止交易通道同步回调时同一线程重复加锁死锁
+	 */
+	StdRecurMutex	_mtx_calc;
 
 	WTSCommodityInfo*	_comm_info;
 	WTSSessionInfo*		_sess_info;
@@ -112,7 +118,7 @@ private:
 	double		_qty_rate;
 
 	WtOrdMon	_orders_mon;
-	uint32_t	_cancel_cnt;
+	std::atomic<uint32_t>	_cancel_cnt;
 	uint32_t	_cancel_times;
 
 	uint64_t	_last_place_time;
@@ -131,7 +137,9 @@ private:
 
 		~_CalcFlag()
 		{
-			if(_flag)
+			//By 差量执行器线程安全 @ 2026.09.24
+			//只有真正拿到标记的调用才能清除标记, 否则重复调用返回时会把正在计算中的标记清掉
+			if(_flag && !_result)
 				_flag->exchange(false, std::memory_order_acq_rel);
 		}
 

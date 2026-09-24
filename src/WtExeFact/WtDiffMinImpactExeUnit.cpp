@@ -22,6 +22,7 @@ extern const char* PriceModeNames[4];
 WtDiffMinImpactExeUnit::WtDiffMinImpactExeUnit()
 	: _last_tick(NULL)
 	, _comm_info(NULL)
+	, _sess_info(NULL)
 	, _price_mode(0)
 	, _price_offset(0)
 	, _expire_secs(0)
@@ -42,6 +43,9 @@ WtDiffMinImpactExeUnit::~WtDiffMinImpactExeUnit()
 
 	if (_comm_info)
 		_comm_info->release();
+
+	if (_sess_info)
+		_sess_info->release();
 }
 
 const char* WtDiffMinImpactExeUnit::getFactName()
@@ -74,6 +78,12 @@ void WtDiffMinImpactExeUnit::init(ExecuteContext* ctx, const char* stdCode, WTSV
 	_order_lots = cfg->getDouble("lots");		//单次发单手数
 	_qty_rate = cfg->getDouble("rate");			//下单手数比例
 
+	if (_price_mode < -1 || _price_mode > 2)
+	{
+		ctx->writeLog(fmtutil::format("Invalid pricemode {} of {}, reset to 0", _price_mode, stdCode));
+		_price_mode = 0;
+	}
+
 	ctx->writeLog(fmtutil::format("DiffMiniImpactExecUnit {} inited, order price: {} ± {} ticks, order expired: {} secs, order timespan:{} millisec, order qty: {} @ {:.2f}",
 		stdCode, PriceModeNames[_price_mode + 1], _price_offset, _expire_secs, _entrust_span, _by_rate ? "byrate" : "byvol", _by_rate ? _qty_rate : _order_lots));
 }
@@ -90,10 +100,19 @@ void WtDiffMinImpactExeUnit::on_order(uint32_t localid, const char* stdCode, boo
 			//这句要注释掉，因为需要早on_trade里处理一些数据
 			//这里如果从OMS中删除了订单号，ontrade就会判断失败
 			//_orders_mon.erase_order(localid);
-			if (_cancel_cnt > 0)
+
+			/*
+			 *	By 差量执行器线程安全 @ 2026.09.24
+			 *	订单不删除, 但要标记为不可撤销
+			 *	否则已结束的订单会一直留在监控里, 每个tick都被超时检查当作过期订单去撤, 撤单统计缓存无限增长
+			 */
+			_orders_mon.set_uncancelable(localid);
+
+			uint32_t cur = _cancel_cnt.load();
+			while (cur > 0 && !_cancel_cnt.compare_exchange_weak(cur, cur - 1)) {}
+			if (cur > 0)
 			{
-				_cancel_cnt--;
-				_ctx->writeLog(fmtutil::format("[{}@{}] Order of {} cancelling done, cancelcnt -> {}", __FILE__, __LINE__, _code.c_str(), _cancel_cnt));
+				_ctx->writeLog(fmtutil::format("[{}@{}] Order of {} cancelling done, cancelcnt -> {}", __FILE__, __LINE__, _code.c_str(), cur - 1));
 			}
 		}
 
@@ -122,14 +141,21 @@ void WtDiffMinImpactExeUnit::on_channel_ready()
 		 *	因为这些订单没有本地订单号，无法直接进行管理
 		 *	这种情况，就是刚启动的时候，上次的未完成单或者外部的挂单
 		 */
-		_ctx->writeLog(fmtutil::format("Unmanaged live orders with qty {} of {} found, cancel all", undone, _code.c_str()));
+		/*
+		 *	By 差量执行器只管自己的仓位 @ 2026.09.24
+		 *	差量执行器的上下文只会撤本执行器自己的挂单(其他来源的挂单不动)
+		 *	原来按账户未完成数量的净方向只撤一个方向, 当别人的挂单方向与自己的相反时, 自己的挂单既不会被撤掉也不在监控中,
+		 *	后续成交无法识别, 所以两个方向自己的挂单都要撤
+		 */
+		_ctx->writeLog(fmtutil::format("Unmanaged live orders with qty {} of {} found, cancel own live orders", undone, _code.c_str()));
 
-		bool isBuy = (undone > 0);
-		OrderIDs ids = _ctx->cancel(_code.c_str(), isBuy);
+		OrderIDs ids = _ctx->cancel(_code.c_str(), true);
+		OrderIDs sellIds = _ctx->cancel(_code.c_str(), false);
+		ids.insert(ids.end(), sellIds.begin(), sellIds.end());
 		_orders_mon.push_order(ids.data(), ids.size(), _ctx->getCurTime());
-		_cancel_cnt += ids.size();
+		_cancel_cnt += (uint32_t)ids.size();
 
-		_ctx->writeLog(fmtutil::format("[{}@{}]cancelcnt -> {}", __FILE__, __LINE__, _cancel_cnt));
+		_ctx->writeLog(fmtutil::format("[{}@{}]cancelcnt -> {}", __FILE__, __LINE__, _cancel_cnt.load()));
 	}
 	else if (decimal::eq(undone, 0) && _orders_mon.has_order())
 	{
@@ -163,21 +189,27 @@ void WtDiffMinImpactExeUnit::on_tick(WTSTickData* newTick)
 	if (newTick == NULL || _code.compare(newTick->code()) != 0)
 		return;
 
-	//如果原来的tick不为空,则要释放掉
-	if (_last_tick)
 	{
-		_last_tick->release();
-	}
-	else
-	{
-		//如果行情时间不在交易时间,这种情况一般是集合竞价的行情进来,下单会失败,所以直接过滤掉这笔行情
-		if (_sess_info != NULL && !_sess_info->isInTradingTime(newTick->actiontime() / 100000))
-			return;
-	}
+		//By 差量执行器线程安全 @ 2026.09.24
+		//替换 _last_tick 必须和 do_calc 互斥, 否则其他线程的 do_calc 可能正在使用被释放的 tick
+		StdLocker<StdRecurMutex> lock(_mtx_calc);
 
-	//新的tick数据,要保留
-	_last_tick = newTick;
-	_last_tick->retain();
+		//如果原来的tick不为空,则要释放掉
+		if (_last_tick)
+		{
+			_last_tick->release();
+		}
+		else
+		{
+			//如果行情时间不在交易时间,这种情况一般是集合竞价的行情进来,下单会失败,所以直接过滤掉这笔行情
+			if (_sess_info != NULL && !_sess_info->isInTradingTime(newTick->actiontime() / 100000))
+				return;
+		}
+
+		//新的tick数据,要保留
+		_last_tick = newTick;
+		_last_tick->retain();
+	}
 
 	/*
 	 *	这里可以考虑一下
@@ -193,7 +225,7 @@ void WtDiffMinImpactExeUnit::on_tick(WTSTickData* newTick)
 			if (_ctx->cancel(localid))
 			{
 				_cancel_cnt++;
-				_ctx->writeLog(fmtutil::format("[{}@{}] Expired order of {} canceled, cancelcnt -> {}", __FILE__, __LINE__, _code.c_str(), _cancel_cnt));
+				_ctx->writeLog(fmtutil::format("[{}@{}] Expired order of {} canceled, cancelcnt -> {}", __FILE__, __LINE__, _code.c_str(), _cancel_cnt.load()));
 			}
 		});
 	}
@@ -207,9 +239,14 @@ void WtDiffMinImpactExeUnit::on_trade(uint32_t localid, const char* stdCode, boo
 	if (!_orders_mon.has_order(localid))
 		return;
 
-	_left_diff -= vol * (isBuy ? 1 : -1);
+	double leftDiff = 0;
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_calc);
+		_left_diff -= vol * (isBuy ? 1 : -1);
+		leftDiff = _left_diff;
+	}
 
-	_ctx->writeLog(fmtutil::format("Left diff of {} updated to {}", _code.c_str(), _left_diff));
+	_ctx->writeLog(fmtutil::format("Left diff of {} updated to {}", _code.c_str(), leftDiff));
 }
 
 void WtDiffMinImpactExeUnit::on_entrust(uint32_t localid, const char* stdCode, bool bSuccess, const char* message)
@@ -246,9 +283,15 @@ void WtDiffMinImpactExeUnit::do_calc()
 	//而ontick也会触发一次do_calc，两次调用是从两个线程分别触发的，所以会出现同时触发的情况
 	//如果不加锁，就会引起问题
 	//这种情况在原来的SimpleExecUnit没有出现，因为SimpleExecUnit只在set_position的时候触发
-	StdUniqueLock lock(_mtx_calc);
+	StdLocker<StdRecurMutex> lock(_mtx_calc);
 
 	const char* stdCode = _code.c_str();
+
+	if (_comm_info == NULL)
+	{
+		_ctx->writeLog(fmtutil::format("Commodity info of {} not found, DiffMinImpactExeUnit cannot place orders", _code));
+		return;
+	}
 
 	double undone = _ctx->getUndoneQty(stdCode);
 	double diffPos = _left_diff;
@@ -413,11 +456,19 @@ void WtDiffMinImpactExeUnit::set_position(const char* stdCode, double newDiff)
 
 	//这里就是最新的差量
 
-	if(_left_diff != newDiff)
+	bool bChanged = false;
 	{
-		_left_diff = newDiff;
+		StdLocker<StdRecurMutex> lock(_mtx_calc);
+		if (_left_diff != newDiff)
+		{
+			_left_diff = newDiff;
+			bChanged = true;
+		}
+	}
 
-		_ctx->writeLog(fmtutil::format("Diff of {} updated to {}", stdCode, _left_diff));
+	if(bChanged)
+	{
+		_ctx->writeLog(fmtutil::format("Diff of {} updated to {}", stdCode, newDiff));
 
 		do_calc();
 	}

@@ -22,13 +22,23 @@ void WtOrdMon::erase_order(uint32_t localid)
 	_orders.erase(it);
 }
 
-void WtOrdMon::check_orders(uint32_t expiresecs, uint64_t curTime, EnumOrderCallback callback)
+void WtOrdMon::set_uncancelable(uint32_t localid)
 {
-	if (_orders.empty())
+	StdLocker<StdRecurMutex> lock(_mtx_ords);
+	auto it = _orders.find(localid);
+	if (it == _orders.end())
 		return;
 
+	it->second.second = false;
+}
 
+void WtOrdMon::check_orders(uint32_t expiresecs, uint64_t curTime, EnumOrderCallback callback)
+{
+	//By 差量执行器线程安全 @ 2026.09.24
+	//判空也要在锁内, 否则和其他线程的 push_order 构成数据竞争
 	StdLocker<StdRecurMutex> lock(_mtx_ords);
+	if (_orders.empty())
+		return;
 	for (auto& m : _orders)
 	{
 		uint32_t localid = m.first;
@@ -46,10 +56,9 @@ void WtOrdMon::check_orders(uint32_t expiresecs, uint64_t curTime, EnumOrderCall
 
 void WtOrdMon::enumOrder(EnumAllOrderCallback cb)
 {
+	StdLocker<StdRecurMutex> lock(_mtx_ords);
 	if (_orders.empty())
 		return;
-
-	StdLocker<StdRecurMutex> lock(_mtx_ords);
 	for (auto& m : _orders)
 	{
 		uint32_t localid = m.first;

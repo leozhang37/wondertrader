@@ -23,11 +23,20 @@ public:
 	void erase_order(uint32_t localid);
 
 	/*
+	 *	将订单标记为不可撤销(订单已结束, 但仍需保留以便后续成交回报能识别)
+	 *	By 差量执行器线程安全 @ 2026.09.24
+	 */
+	void set_uncancelable(uint32_t localid);
+
+	/*
 	 *	检查是否有订单
 	 *	@localid	订单号,为0时检查是否有任意订单,不为0时检查是否有指定订单
 	 */
 	inline bool has_order(uint32_t localid = 0)
 	{
+		//By 差量执行器线程安全 @ 2026.09.24
+		//订单回报线程和行情线程会同时访问, 查询也需要加锁
+		StdLocker<StdRecurMutex> lock(_mtx_ords);
 		if (localid == 0)
 			return !_orders.empty();
 
@@ -42,6 +51,7 @@ public:
 
 	inline void clear_orders()
 	{
+		StdLocker<StdRecurMutex> lock(_mtx_ords);
 		_orders.clear();
 	}
 
