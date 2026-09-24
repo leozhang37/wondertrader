@@ -480,6 +480,7 @@ void SelMocker::on_strategy_schedule(uint32_t curDate, uint32_t curTime)
 bool SelMocker::on_schedule(uint32_t curDate, uint32_t curTime, uint32_t fireTime)
 {
 	_is_in_schedule = true;//开始调度,修改标记
+	_declared_codes.clear();
 
 	_schedule_times++;
 
@@ -491,7 +492,7 @@ bool SelMocker::on_schedule(uint32_t curDate, uint32_t curTime, uint32_t fireTim
 	{
 		const PosInfo& pInfo = v.second;
 		const char* code = v.first.c_str();
-		if(_sig_map.find(code) == _sig_map.end() && !decimal::eq(pInfo._volume, 0.0))
+		if (_sig_map.find(code) == _sig_map.end() && _declared_codes.find(code) == _declared_codes.end() && !decimal::eq(pInfo._volume, 0.0))
 		{
 			//新的信号中没有该持仓,则要清空
 			to_clear.insert(code);
@@ -602,6 +603,14 @@ void SelMocker::stra_set_position(const char* stdCode, double qty, const char* u
 		log_error("Cannot short on {}", stdCode);
 		return;
 	}
+
+	/*
+	 *	By SEL调度持仓保持 @ 2026.09.24
+	 *	先记录该合约在本次调度中被声明过, 再判断是否需要生成信号
+	 *	否则目标仓位与当前持仓一致时直接返回, 调度结束时会被当作"新信号中没有该持仓"而自动平仓
+	 */
+	if (_is_in_schedule)
+		_declared_codes.insert(stdCode);
 
 	double total = stra_get_position(stdCode, false);
 	//如果目标仓位和当前仓位是一致的，直接退出

@@ -222,6 +222,9 @@ protected:
 	}SigInfo;
 	typedef wt_hashmap<std::string, SigInfo>	SignalMap;
 	SignalMap		_sig_map;
+	//By SEL调度持仓保持 @ 2026.09.24
+	//本次调度中策略声明过目标仓位的合约(含目标与当前持仓一致而未生成信号的), 用于判断是否需要自动平仓
+	wt_hashset<std::string>	_declared_codes;
 
 	BoostFilePtr	_trade_logs;
 	BoostFilePtr	_close_logs;
