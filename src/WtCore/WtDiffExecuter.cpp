@@ -19,6 +19,11 @@
 #include "../Includes/IBaseDataMgr.h"
 #include "../Share/decimal.h"
 
+#include <tuple>
+
+#include "../Includes/WTSTradeDef.hpp"
+#include "../Includes/WTSContractInfo.hpp"
+
 #include "../WTSTools/WTSLogger.h"
 
 #include <rapidjson/document.h>
@@ -136,10 +141,21 @@ void WtDiffExecuter::load_data()
 			_diff_pos[stdCode] = pos;
 		}
 	}
+
+	//By 差量执行器只管自己的仓位 @ 2026.09.24
+	//恢复上次会话中自己发出的订单号, 重启后查询到的挂单/成交据此判断是否属于本执行器
+	if (root.HasMember("orders"))
+	{
+		const rj::Value& jOrders = root["orders"];
+		for (const rj::Value& jItem : jOrders.GetArray())
+			_own_orders[jItem.GetUint()] = 0;
+	}
 }
 
 void WtDiffExecuter::save_data()
 {
+	StdLocker<StdRecurMutex> lock(_mtx_pos);
+
 	std::string filename = WtHelper::getExecDataDir();
 	filename += _name + ".json";
 
@@ -176,6 +192,28 @@ void WtDiffExecuter::save_data()
 		root.AddMember("diffs", jDiff, allocator);
 	}
 
+	{//自己发出的订单号保存
+	 //已结束超过60秒的订单不再需要(成交回报早已到达), 顺便从内存中清理掉
+		const uint64_t KEEP_MS = 60 * 1000;
+		uint64_t now = TimeUtils::getLocalTimeNow();
+		rj::Value jOrders(rj::kArrayType);
+
+		SpinLock lock(_mtx_own);
+		for (auto it = _own_orders.begin(); it != _own_orders.end();)
+		{
+			if (it->second != 0 && now - it->second > KEEP_MS)
+			{
+				it = _own_orders.erase(it);
+				continue;
+			}
+
+			jOrders.PushBack(it->first, allocator);
+			it++;
+		}
+
+		root.AddMember("orders", jOrders, allocator);
+	}
+
 	{
 		std::string filename = WtHelper::getExecDataDir();
 		filename += _name + ".json";
@@ -202,38 +240,70 @@ ExecuteUnitPtr WtDiffExecuter::getUnit(const char* stdCode, bool bAutoCreate /* 
 	if (!policy->has(commID.c_str()))
 		des = "default";
 
-	//SpinLock lock(_mtx_units);
-
-	auto it = _unit_map.find(stdCode);
-	if(it != _unit_map.end())
+	ExecuteUnitPtr unit;
 	{
-		return it->second;
-	}
+		SpinLock lock(_mtx_units);
 
-	if (bAutoCreate)
-	{
+		auto it = _unit_map.find(stdCode);
+		if(it != _unit_map.end())
+		{
+			return it->second;
+		}
+
+		if (!bAutoCreate)
+			return ExecuteUnitPtr();
+
 		WTSVariant* cfg = policy->get(des.c_str());
+		if (cfg == NULL)
+		{
+			WTSLogger::error("No execute unit policy for {} configured in executer {}", stdCode, _name);
+			return ExecuteUnitPtr();
+		}
 
 		const char* name = cfg->getCString("name");
-		ExecuteUnitPtr unit = _factory->createDiffExeUnit(name);
-		if (unit != NULL)
-		{
-			_unit_map[stdCode] = unit;
-			unit->self()->init(this, stdCode, cfg);
-
-			//如果通道已经就绪，则直接通知执行单元
-			if (_channel_ready)
-				unit->self()->on_channel_ready();
-		}
-		else
+		unit = _factory->createDiffExeUnit(name);
+		if (unit == NULL)
 		{
 			WTSLogger::error("Creating ExecUnit {} failed", name);
+			return unit;
 		}
-		return unit;
+
+		//先初始化再放入, 避免其他线程拿到未初始化的执行单元
+		unit->self()->init(this, stdCode, cfg);
+		_unit_map[stdCode] = unit;
+	}
+
+	//如果通道已经就绪，则直接通知执行单元(不持锁回调)
+	if (_channel_ready)
+		unit->self()->on_channel_ready();
+
+	return unit;
+}
+
+std::vector<ExecuteUnitPtr> WtDiffExecuter::snapshot_units()
+{
+	std::vector<ExecuteUnitPtr> ret;
+	SpinLock lock(_mtx_units);
+	ret.reserve(_unit_map.size());
+	for (auto it = _unit_map.begin(); it != _unit_map.end(); it++)
+	{
+		if (it->second)
+			ret.emplace_back(it->second);
+	}
+	return ret;
+}
+
+void WtDiffExecuter::dispatch_diff(ExecuteUnitPtr unit, const std::string& stdCode, double diff)
+{
+	if (_pool)
+	{
+		_pool->schedule([unit, stdCode, diff]() {
+			unit->self()->set_position(stdCode.c_str(), diff);
+		});
 	}
 	else
 	{
-		return ExecuteUnitPtr();
+		unit->self()->set_position(stdCode.c_str(), diff);
 	}
 }
 
@@ -278,7 +348,13 @@ OrderMap* WtDiffExecuter::getOrders(const char* stdCode)
 	if (NULL == _trader)
 		return NULL;
 
-	return _trader->getOrders(stdCode);
+	//By 差量执行器只管自己的仓位 @ 2026.09.24
+	//只返回本执行器自己的存活委托
+	OrderMap* ret = OrderMap::create();
+	enum_own_alive_orders(stdCode, [ret](uint32_t localid, WTSOrderInfo* ordInfo, bool) {
+		ret->add(localid, ordInfo);
+	});
+	return ret;
 }
 
 OrderIDs WtDiffExecuter::buy(const char* stdCode, double price, double qty, bool bForceClose/* = false*/)
@@ -286,7 +362,9 @@ OrderIDs WtDiffExecuter::buy(const char* stdCode, double price, double qty, bool
 	if (!_channel_ready)
 		return OrderIDs();
 
-	return _trader->buy(stdCode, price, qty, 0, bForceClose);
+	OrderIDs ids = _trader->buy(stdCode, price, qty, 0, bForceClose);
+	add_own_orders(ids);
+	return ids;
 }
 
 OrderIDs WtDiffExecuter::sell(const char* stdCode, double price, double qty, bool bForceClose/* = false*/)
@@ -294,13 +372,22 @@ OrderIDs WtDiffExecuter::sell(const char* stdCode, double price, double qty, boo
 	if (!_channel_ready)
 		return OrderIDs();
 
-	return _trader->sell(stdCode, price, qty, 0, bForceClose);
+	OrderIDs ids = _trader->sell(stdCode, price, qty, 0, bForceClose);
+	add_own_orders(ids);
+	return ids;
 }
 
 bool WtDiffExecuter::cancel(uint32_t localid)
 {
 	if (!_channel_ready)
 		return false;
+
+	//By 差量执行器只管自己的仓位 @ 2026.09.24
+	if (!is_own_order(localid))
+	{
+		WTSLogger::log_dyn("executer", _name.c_str(), LL_WARN, "[{}] Order {} is not placed by this executer, cancel ignored", _name, localid);
+		return false;
+	}
 
 	return _trader->cancel(localid);
 }
@@ -310,7 +397,113 @@ OrderIDs WtDiffExecuter::cancel(const char* stdCode, bool isBuy, double qty)
 	if (!_channel_ready)
 		return OrderIDs();
 
-	return _trader->cancel(stdCode, isBuy, qty);
+	/*
+	 *	By 差量执行器只管自己的仓位 @ 2026.09.24
+	 *	原来直接调用 _trader->cancel(stdCode, isBuy, qty), 会把合约上所有同方向的挂单(包括手工单、其他执行器的单)都撤掉
+	 *	这里只撤本执行器自己的挂单
+	 */
+	std::vector<uint32_t> toCancel;
+	double actQty = 0;
+	enum_own_alive_orders(stdCode, [&](uint32_t localid, WTSOrderInfo* ordInfo, bool bBuy) {
+		if (bBuy != isBuy)
+			return;
+
+		if (qty > 0 && decimal::ge(actQty, qty))
+			return;
+
+		toCancel.emplace_back(localid);
+		actQty += ordInfo->getVolLeft();
+	});
+
+	OrderIDs ret;
+	for (uint32_t localid : toCancel)
+	{
+		if (_trader->cancel(localid))
+			ret.emplace_back(localid);
+	}
+	return ret;
+}
+
+void WtDiffExecuter::add_own_orders(const OrderIDs& ids)
+{
+	if (ids.empty())
+		return;
+
+	{
+		SpinLock lock(_mtx_own);
+		for (uint32_t localid : ids)
+			_own_orders[localid] = 0;
+	}
+
+	//订单号要立即落地, 否则发单后异常退出, 重启后就识别不出这些挂单
+	save_data();
+}
+
+bool WtDiffExecuter::is_valid_contract(const char* stdCode)
+{
+	CodeHelper::CodeInfo cInfo = CodeHelper::extractStdCode(stdCode, NULL);
+	return _bd_mgr->getContract(cInfo._code, cInfo._exchg) != NULL;
+}
+
+bool WtDiffExecuter::is_own_order(uint32_t localid)
+{
+	if (localid == 0)
+		return false;
+
+	SpinLock lock(_mtx_own);
+	return _own_orders.find(localid) != _own_orders.end();
+}
+
+void WtDiffExecuter::finish_own_order(uint32_t localid)
+{
+	SpinLock lock(_mtx_own);
+	auto it = _own_orders.find(localid);
+	if (it != _own_orders.end() && it->second == 0)
+		it->second = TimeUtils::getLocalTimeNow();
+}
+
+void WtDiffExecuter::enum_own_alive_orders(const char* stdCode, std::function<void(uint32_t, WTSOrderInfo*, bool)> cb)
+{
+	if (NULL == _trader)
+		return;
+
+	//TraderAdapter::getOrders 按原始合约代码比较, 传标准代码匹配不上, 所以取全部订单后自己按标准代码过滤
+	OrderMap* orders = _trader->getOrders("");
+	if (orders == NULL)
+		return;
+
+	for (auto it = orders->begin(); it != orders->end(); it++)
+	{
+		uint32_t localid = it->first;
+		WTSOrderInfo* ordInfo = (WTSOrderInfo*)it->second;
+		if (ordInfo == NULL || !ordInfo->isAlive() || !is_own_order(localid))
+			continue;
+
+		std::string code;
+		WTSContractInfo* cInfo = ordInfo->getContractInfo();
+		if (cInfo != NULL)
+		{
+			WTSCommodityInfo* commInfo = cInfo->getCommInfo();
+			if (commInfo->getCategoty() == CC_FutOption || commInfo->getCategoty() == CC_SpotOption)
+				code = CodeHelper::rawFutOptCodeToStdCode(cInfo->getCode(), cInfo->getExchg());
+			else if (CodeHelper::isMonthlyCode(cInfo->getCode()))
+				code = CodeHelper::rawMonthCodeToStdCode(cInfo->getCode(), cInfo->getExchg());
+			else
+				code = CodeHelper::rawFlatCodeToStdCode(cInfo->getCode(), cInfo->getExchg(), cInfo->getProduct());
+		}
+		else
+		{
+			code = CodeHelper::rawMonthCodeToStdCode(ordInfo->getCode(), ordInfo->getExchg());
+		}
+
+		if (strlen(stdCode) != 0 && code.compare(stdCode) != 0)
+			continue;
+
+		bool isBuy = (ordInfo->getDirection() == WDT_LONG && ordInfo->getOffsetType() == WOT_OPEN) || (ordInfo->getDirection() == WDT_SHORT && ordInfo->getOffsetType() != WOT_OPEN);
+		cb(localid, ordInfo, isBuy);
+	}
+
+	orders->release();
 }
 
 void WtDiffExecuter::writeLog(const char* message)
@@ -354,19 +547,24 @@ void WtDiffExecuter::on_position_changed(const char* stdCode, double diffPos)
 
 	diffPos = round(diffPos*_scale);
 
-	double oldVol = _target_pos[stdCode];
-	double& targetPos = _target_pos[stdCode];
-	targetPos += diffPos;
+	double newDiff = 0;
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_pos);
+		double oldVol = _target_pos[stdCode];
+		double& targetPos = _target_pos[stdCode];
+		targetPos += diffPos;
 
-	/*
-	 *	By Sunseeeeeker @ 2023.01.10
-	 *	更新差量
-	*/
-	double& thisDiff = _diff_pos[stdCode];
-	double prevDiff = thisDiff;
-	thisDiff += diffPos;
+		/*
+		 *	By Sunseeeeeker @ 2023.01.10
+		 *	更新差量
+		*/
+		double& thisDiff = _diff_pos[stdCode];
+		double prevDiff = thisDiff;
+		thisDiff += diffPos;
+		newDiff = thisDiff;
 
-	WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Target position of {} changed additonally: {} -> {}, diff postion changed: {} -> {}", _name, stdCode, oldVol, targetPos, prevDiff, thisDiff);
+		WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Target position of {} changed additonally: {} -> {}, diff postion changed: {} -> {}", _name, stdCode, oldVol, targetPos, prevDiff, thisDiff);
+	}
 
 	if (_trader && !_trader->checkOrderLimits(stdCode))
 	{
@@ -375,107 +573,131 @@ void WtDiffExecuter::on_position_changed(const char* stdCode, double diffPos)
 	}
 
 	//TODO 差量执行还要再看一下
-	if (_pool)
-	{
-		std::string code = stdCode;
-		_pool->schedule([unit, code, thisDiff]() {
-			unit->self()->set_position(code.c_str(), thisDiff);
-		});
-	}
-	else
-	{
-		unit->self()->set_position(stdCode, thisDiff);
-	}
+	dispatch_diff(unit, stdCode, newDiff);
 }
 
 void WtDiffExecuter::set_position(const wt_hashmap<std::string, double>& targets)
 {
+	/*
+	 *	By 差量执行器线程安全 @ 2026.09.24
+	 *	getUnit 创建执行单元时会回调执行单元(on_channel_ready -> do_calc, 持有执行单元的计算锁),
+	 *	而执行单元下单后会回到执行器落地订单号(需要 _mtx_pos), 所以不能在持有 _mtx_pos 时调用 getUnit,
+	 *	否则两个线程分别按 _mtx_pos->计算锁 和 计算锁->_mtx_pos 的顺序加锁会死锁
+	 *	先在锁外准备好所有需要的执行单元, 再在锁内更新目标仓位和差量, 最后在锁外推送差量
+	 */
+	wt_hashmap<std::string, ExecuteUnitPtr> units;
 	for (auto it = targets.begin(); it != targets.end(); it++)
 	{
-		const char* stdCode = it->first.c_str();
-		double newVol = it->second;
-		ExecuteUnitPtr unit = getUnit(stdCode);
-		if (unit == NULL)
-			continue;
+		ExecuteUnitPtr unit = getUnit(it->first.c_str());
+		if (unit != NULL)
+			units[it->first] = unit;
+	}
 
-		newVol = round(newVol*_scale);
-		double oldVol = _target_pos[stdCode];
-		_target_pos[stdCode] = newVol;
-		if (decimal::eq(oldVol, newVol))
-			continue;
-
-		//差量更新
-		double& thisDiff = _diff_pos[stdCode];
-		double prevDiff = thisDiff;
-		thisDiff += (newVol - oldVol);
-
-		WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Target position of {} changed: {} -> {}, diff postion changed: {} -> {}", _name, stdCode, oldVol, newVol, prevDiff, thisDiff);
-
-		if (_trader && !_trader->checkOrderLimits(stdCode))
+	std::vector<std::string> dropped;
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_pos);
+		for (auto it = _target_pos.begin(); it != _target_pos.end(); it++)
 		{
-			WTSLogger::log_dyn("executer", _name.c_str(), LL_WARN, "[{}] {} is disabled due to entrust limit control ", _name, stdCode);
-			continue;
-		}
-
-		//TODO 差量执行还要再看一下
-		if (_pool)
-		{
-			std::string code = stdCode;
-			_pool->schedule([unit, code, thisDiff](){
-				unit->self()->set_position(code.c_str(), thisDiff);
-			});
-		}
-		else
-		{
-			unit->self()->set_position(stdCode, thisDiff);
+			if (targets.find(it->first) == targets.end() && it->second != 0)
+				dropped.emplace_back(it->first);
 		}
 	}
 
-	//在原来的目标头寸中，但是不在新的目标头寸中，则需要自动设置为0
-	for (auto it = _target_pos.begin(); it != _target_pos.end(); it++)
+	for (const std::string& stdCode : dropped)
 	{
-		const char* stdCode = it->first.c_str();
-		double& pos = (double&)it->second;
-		auto tit = targets.find(stdCode);
-		if(tit != targets.end())
+		if (!is_valid_contract(stdCode.c_str()))
 			continue;
 
-		WTSContractInfo* cInfo = _bd_mgr->getContract(stdCode);
-		if(cInfo == NULL)
-			continue;
+		ExecuteUnitPtr unit = getUnit(stdCode.c_str());
+		if (unit != NULL)
+			units[stdCode] = unit;
+	}
 
-		if(pos != 0)
+	std::vector<std::tuple<ExecuteUnitPtr, std::string, double>> dispatches;
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_pos);
+
+		for (auto it = targets.begin(); it != targets.end(); it++)
 		{
-			WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] {} is not in target, set to 0 automatically", _name, stdCode);
-
-			ExecuteUnitPtr unit = getUnit(stdCode);
-			if (unit == NULL)
+			const char* stdCode = it->first.c_str();
+			double newVol = it->second;
+			auto uit = units.find(it->first);
+			if (uit == units.end())
 				continue;
 
-			//更新差量
+			ExecuteUnitPtr unit = uit->second;
+
+			newVol = round(newVol*_scale);
+			double oldVol = _target_pos[stdCode];
+			_target_pos[stdCode] = newVol;
+			if (decimal::eq(oldVol, newVol))
+				continue;
+
+			//差量更新
 			double& thisDiff = _diff_pos[stdCode];
 			double prevDiff = thisDiff;
+			thisDiff += (newVol - oldVol);
 
-			//WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[DiffExecuter][set_position][{}] {} is not in target, thisDiff: {}, prevDiff: {}, pos: {}, new thisDiff: {}", _name, stdCode, thisDiff, prevDiff, pos, thisDiff + pos);
+			WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Target position of {} changed: {} -> {}, diff postion changed: {} -> {}", _name, stdCode, oldVol, newVol, prevDiff, thisDiff);
 
-			thisDiff -= -pos;
-			pos = 0;
-
-			if (_pool)
+			if (_trader && !_trader->checkOrderLimits(stdCode))
 			{
-				std::string code = stdCode;
-				_pool->schedule([unit, code, thisDiff]() {
-					unit->self()->set_position(code.c_str(), thisDiff);
-				});
+				WTSLogger::log_dyn("executer", _name.c_str(), LL_WARN, "[{}] {} is disabled due to entrust limit control ", _name, stdCode);
+				continue;
 			}
-			else
+
+			//TODO 差量执行还要再看一下
+			dispatches.emplace_back(unit, it->first, thisDiff);
+		}
+
+		//在原来的目标头寸中，但是不在新的目标头寸中，则需要自动设置为0
+		for (auto it = _target_pos.begin(); it != _target_pos.end(); it++)
+		{
+			const char* stdCode = it->first.c_str();
+			double& pos = (double&)it->second;
+			auto tit = targets.find(stdCode);
+			if(tit != targets.end())
+				continue;
+
+			/*
+			 *	By 差量执行器只管自己的仓位 @ 2026.09.24
+			 *	原来是 _bd_mgr->getContract(stdCode), 基础数据按原始代码(如rb2610)索引, 传标准代码(如SHFE.rb.2610)永远查不到,
+			 *	导致这个分支从未执行: 不在目标中的合约, 自己的仓位一直不会被平掉
+			 */
+			if (!is_valid_contract(stdCode))
+				continue;
+
+			if(pos != 0)
 			{
-				unit->self()->set_position(stdCode, thisDiff);
+				WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] {} is not in target, set to 0 automatically", _name, stdCode);
+
+				auto uit = units.find(it->first);
+				if (uit == units.end())
+					continue;
+
+				//更新差量
+				double& thisDiff = _diff_pos[stdCode];
+				double prevDiff = thisDiff;
+
+				/*
+				 *	By 差量执行器线程安全 @ 2026.09.24
+				 *	目标仓位从 pos 变为 0, 差量应变化 0 - pos, 与上面目标仓位显式设为 0 时的 thisDiff += (newVol - oldVol) 一致
+				 *	原来写成 thisDiff -= -pos, 实际是加上 pos, 方向相反, 会在自己原有仓位的基础上再开同方向同数量的仓
+				 */
+				thisDiff -= pos;
+				pos = 0;
+
+				WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Diff of {} changed: {} -> {} as target reset to 0", _name, stdCode, prevDiff, thisDiff);
+
+				dispatches.emplace_back(uit->second, it->first, thisDiff);
 			}
 		}
+
+		save_data();
 	}
 
-	save_data();
+	for (auto& item : dispatches)
+		dispatch_diff(std::get<0>(item), std::get<1>(item), std::get<2>(item));
 }
 
 void WtDiffExecuter::on_tick(const char* stdCode, WTSTickData* newTick)
@@ -505,16 +727,24 @@ void WtDiffExecuter::on_trade(uint32_t localid, const char* stdCode, bool isBuy,
 	if (unit == NULL)
 		return;
 
-	if (localid == 0)
+	/*
+	 *	By 差量执行器只管自己的仓位 @ 2026.09.24
+	 *	原来只判断 localid 不为 0, 同一交易通道上其他执行器的成交也会被扣减到本执行器的差量上
+	 *	只有本执行器自己发出的订单的成交才更新差量
+	 */
+	if (!is_own_order(localid))
 		return;
 
-	//如果localid不为0，则更新差量
-	double& curDiff = _diff_pos[stdCode];
-	double prevDiff = curDiff;
-	curDiff -= vol * (isBuy ? 1 : -1);
+	//自己订单的成交, 更新差量
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_pos);
+		double& curDiff = _diff_pos[stdCode];
+		double prevDiff = curDiff;
+		curDiff -= vol * (isBuy ? 1 : -1);
 
-	WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Diff of {} updated by trade: {} -> {}", _name, stdCode, prevDiff, curDiff);
-	save_data();
+		WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Diff of {} updated by trade: {} -> {}", _name, stdCode, prevDiff, curDiff);
+		save_data();
+	}
 
 	if (_pool)
 	{
@@ -535,6 +765,13 @@ void WtDiffExecuter::on_order(uint32_t localid, const char* stdCode, bool isBuy,
 	if (unit == NULL)
 		return;
 
+	//By 差量执行器只管自己的仓位 @ 2026.09.24
+	if (!is_own_order(localid))
+		return;
+
+	if (isCanceled || decimal::eq(leftQty, 0))
+		finish_own_order(localid);
+
 	if (_pool)
 	{
 		std::string code = stdCode;
@@ -554,6 +791,13 @@ void WtDiffExecuter::on_entrust(uint32_t localid, const char* stdCode, bool bSuc
 	if (unit == NULL)
 		return;
 
+	//By 差量执行器只管自己的仓位 @ 2026.09.24
+	if (!is_own_order(localid))
+		return;
+
+	if (!bSuccess)
+		finish_own_order(localid);
+
 	if (_pool)
 	{
 		std::string code = stdCode;
@@ -571,68 +815,54 @@ void WtDiffExecuter::on_entrust(uint32_t localid, const char* stdCode, bool bSuc
 void WtDiffExecuter::on_channel_ready()
 {
 	_channel_ready = true;
-	//SpinLock lock(_mtx_units);
-	for (auto it = _unit_map.begin(); it != _unit_map.end(); it++)
+	for (ExecuteUnitPtr& unitPtr : snapshot_units())
 	{
-		ExecuteUnitPtr& unitPtr = (ExecuteUnitPtr&)it->second;
-		if (unitPtr)
-		{
-			if (_pool)
-			{
-				_pool->schedule([unitPtr](){
-					unitPtr->self()->on_channel_ready();
-				});
-			}
-			else
-			{
-				unitPtr->self()->on_channel_ready();
-			}
-		}
-	}
-
-	for(auto& v : _diff_pos)
-	{
-		const char* stdCode = v.first.c_str();
-		ExecuteUnitPtr unit = getUnit(stdCode);
-		if (unit == NULL)
-			continue;
-		double thisDiff = _diff_pos[stdCode];
-
 		if (_pool)
 		{
-			std::string code = stdCode;
-			_pool->schedule([unit, code, thisDiff]() {
-				unit->self()->set_position(code.c_str(), thisDiff);
+			_pool->schedule([unitPtr](){
+				unitPtr->self()->on_channel_ready();
 			});
 		}
 		else
 		{
-			unit->self()->set_position(stdCode, thisDiff);
+			unitPtr->self()->on_channel_ready();
 		}
+	}
 
-		WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Diff of {} recovered to {}", _name, stdCode, thisDiff);
+	//先复制一份差量再推送, 避免遍历 _diff_pos 时被其他线程修改
+	std::vector<std::pair<std::string, double>> diffs;
+	{
+		StdLocker<StdRecurMutex> lock(_mtx_pos);
+		diffs.assign(_diff_pos.begin(), _diff_pos.end());
+	}
+
+	for(auto& v : diffs)
+	{
+		const std::string& stdCode = v.first;
+		ExecuteUnitPtr unit = getUnit(stdCode.c_str());
+		if (unit == NULL)
+			continue;
+
+		dispatch_diff(unit, stdCode, v.second);
+
+		WTSLogger::log_dyn("executer", _name.c_str(), LL_INFO, "[{}] Diff of {} recovered to {}", _name, stdCode, v.second);
 	}
 }
 
 void WtDiffExecuter::on_channel_lost()
 {
 	_channel_ready = false;
-	//SpinLock lock(_mtx_units);
-	for (auto it = _unit_map.begin(); it != _unit_map.end(); it++)
+	for (ExecuteUnitPtr& unitPtr : snapshot_units())
 	{
-		ExecuteUnitPtr& unitPtr = (ExecuteUnitPtr&)it->second;
-		if (unitPtr)
+		if (_pool)
 		{
-			if (_pool)
-			{
-				_pool->schedule([unitPtr](){
-					unitPtr->self()->on_channel_lost();
-				});
-			}
-			else
-			{
+			_pool->schedule([unitPtr](){
 				unitPtr->self()->on_channel_lost();
-			}
+			});
+		}
+		else
+		{
+			unitPtr->self()->on_channel_lost();
 		}
 	}
 }
@@ -640,23 +870,18 @@ void WtDiffExecuter::on_channel_lost()
 void WtDiffExecuter::on_account(const char* currency, double prebalance, double balance, double dynbalance,
 	double avaliable, double closeprofit, double dynprofit, double margin, double fee, double deposit, double withdraw)
 {
-	//SpinLock lock(_mtx_units);
-	for (auto it = _unit_map.begin(); it != _unit_map.end(); it++)
+	for (ExecuteUnitPtr& unitPtr : snapshot_units())
 	{
-		ExecuteUnitPtr& unitPtr = (ExecuteUnitPtr&)it->second;
-		if (unitPtr)
+		if (_pool)
 		{
-			if (_pool)
-			{
-				std::string strCur = currency;
-				_pool->schedule([unitPtr, strCur, prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw]() {
-					unitPtr->self()->on_account(strCur.c_str(), prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw);
-				});
-			}
-			else
-			{
-				unitPtr->self()->on_account(currency, prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw);
-			}
+			std::string strCur = currency;
+			_pool->schedule([unitPtr, strCur, prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw]() {
+				unitPtr->self()->on_account(strCur.c_str(), prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw);
+			});
+		}
+		else
+		{
+			unitPtr->self()->on_account(currency, prebalance, balance, dynbalance, avaliable, closeprofit, dynprofit, margin, fee, deposit, withdraw);
 		}
 	}
 }
