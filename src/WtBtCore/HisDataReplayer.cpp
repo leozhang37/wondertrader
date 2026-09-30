@@ -591,6 +591,19 @@ void HisDataReplayer::notify_state(const char* stdCode, WTSKlinePeriod period, u
 	_notifier->notifyData("BT_STATE", (void*)output.c_str(), output.size());
 }
 
+/*
+ *	By 秒线主力拼接修复 @ 2026.09.30
+ *	把 date + HHMM(+秒) 编成和该周期bar.time同一编码的时间戳, 用于在K线里定位
+ *	分钟线为 (date-19900000)*10000+HHMM, 秒线为 yyyyMMddHHmmss
+ */
+static inline uint64_t make_bar_time(WTSKlinePeriod period, uint32_t uDate, uint32_t uTime, uint32_t uSecs = 0)
+{
+	if (period == KP_Sec5)
+		return (uint64_t)uDate * 1000000 + uTime * 100 + uSecs;
+
+	return (uint64_t)(uDate - 19900000) * 10000 + uTime;
+}
+
 uint32_t HisDataReplayer::locate_barindex(const std::string& key, uint64_t now, bool bUpperBound /* = false */)
 {
 	uint32_t curDate, curTime;
@@ -605,7 +618,8 @@ uint32_t HisDataReplayer::locate_barindex(const std::string& key, uint64_t now, 
 
 	WTSBarStruct bar;
 	bar.date = curDate;
-	bar.time = (curDate - 19900000) * 10000 + curTime;
+	//now只有分钟精度, 秒线找上边界时要包含这一分钟内的所有bar
+	bar.time = make_bar_time(barsList->_period, curDate, curTime, bUpperBound ? 59 : 0);
 	auto it = std::lower_bound(barsList->_bars.begin(), barsList->_bars.end(), bar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b) {
 		if (isDay)
 			return a.date < b.date;
@@ -1290,8 +1304,15 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 					 */
 					bool bCanSim = !_nosim_if_notrade || !decimal::eq(nextBar.vol, 0.0);
 
-					uint64_t barTime = 199000000000 + nextBar.time;
-					if (barTime == nowTime && bCanSim)
+					/*
+					 *	秒线bar为 yyyyMMddHHmmss, 要和秒精度的当前时间比较
+					 *	uTime只有HHMM, 秒位取 _cur_secs(毫秒), run_by_bars在调用前已经设好
+					 *	By 秒线主力拼接修复 @ 2026.09.30
+					 */
+					bool isSecBar = (barsList->_period == KP_Sec5);
+					uint64_t barTime = isSecBar ? nextBar.time : (199000000000 + nextBar.time);
+					uint64_t cmpTime = isSecBar ? make_bar_time(KP_Sec5, uDate, uTime, _cur_secs / 1000) : nowTime;
+					if (barTime == cmpTime && bCanSim)
 					{
 						const std::string& ticker = _ticker_keys[barsList->_code];
 						if (ticker == it->first)
@@ -1300,7 +1321,7 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 							WTSTickStruct& curTS = _day_cache[barsList->_code];
 							strcpy(curTS.code, barsList->_code.c_str());
 							curTS.action_date = _cur_date;
-							curTS.action_time = _cur_time * 100000;
+							curTS.action_time = _cur_time * 100000 + (isSecBar ? _cur_secs : 0);
 
 							double newPx = 0.0;
 							if (pxType == 0)
@@ -1333,7 +1354,7 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 
 						break;
 					}
-					else if (barTime < nowTime)
+					else if (barTime < cmpTime)
 					{
 						barsList->_cursor++;
 
@@ -1346,7 +1367,7 @@ void HisDataReplayer::simTicks(uint32_t uDate, uint32_t uTime, uint32_t endTDate
 					{
 						break;
 					}
-				} 
+				}
 			}
 		}
 		else
@@ -1942,7 +1963,13 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 		nextTime = min(nextTime, getNextOrdQueTime(_cur_tdate, stime));
 		nextTime = min(nextTime, getNextTransTime(_cur_tdate, stime));
 
-		if (nextTime/100000 >= etime)
+		/*
+		 *	etime 是下一根主K线的时间: 分钟线为 yyyyMMddHHMM(12位), 秒线为 yyyyMMddHHmmss(14位)
+		 *	nextTime 为 yyyyMMddHHMMSSmmm, 要截到和 etime 同样的精度再比
+		 *	By 秒线主力拼接修复 @ 2026.09.30
+		 */
+		uint64_t cmpTime = (etime >= 10000000000000ULL) ? (nextTime / 1000) : (nextTime / 100000);
+		if (cmpTime >= etime)
 			break;
 
 		_cur_date = (uint32_t)(nextTime / 1000000000);
@@ -1975,7 +2002,7 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 		{
 			const char* stdCode = v.first.c_str();
 			auto& itemList = _trans_cache[stdCode];
-			if (itemList._cursor = itemList._count)
+			if (itemList._cursor > itemList._count)
 				continue;
 
 			auto& nextItem = itemList._items[itemList._cursor - 1];
@@ -2146,8 +2173,11 @@ void HisDataReplayer::onMinuteEnd(uint32_t uDate, uint32_t uTime, uint32_t endTD
 				{
 					WTSBarStruct& nextBar = barsList->_bars[barsList->_cursor];
 
-					uint64_t barTime = 199000000000 + nextBar.time;
-					if (barTime > nowTime)
+					//秒线和订阅K线一样, 用秒精度的时间轴比较
+					bool isSecBar = (barsList->_period == KP_Sec5);
+					uint64_t barTime = isSecBar ? nextBar.time : (199000000000 + nextBar.time);
+					uint64_t cmpTime = isSecBar ? _sec_now_stamp : nowTime;
+					if (barTime > cmpTime)
 						break;
 
 					barsList->_cursor++;
@@ -2417,8 +2447,8 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 		WTSBarStruct bar;
 		bar.date = _cur_tdate;
 		if(kp != KP_DAY)
-			bar.time = (_cur_date - 19900000) * 10000 + _cur_time;
-		
+			bar.time = make_bar_time(kp, _cur_date, _cur_time, _cur_secs / 1000);
+
 		auto it = std::lower_bound(kBlkPair->_bars.begin(), kBlkPair->_bars.end(), bar, [isDay, isClosed](const WTSBarStruct& a, const WTSBarStruct& b){
 			if (isDay)
 				if (!isClosed)
@@ -2489,7 +2519,12 @@ WTSKlineSlice* HisDataReplayer::get_kline_slice(const char* stdCode, const char*
 	}
 	else
 	{
-		uint32_t curMin = (_cur_date - 19900000) * 10000 + _cur_time;
+		/*
+		 *	秒线的bar时间是 yyyyMMddHHmmss, 用分钟编码比较会恒大于当前时间,
+		 *	每次取K线游标都会被退一格, 回放时和onMinuteEnd来回拉扯, 陷入死循环
+		 *	By 秒线主力拼接修复 @ 2026.09.30
+		 */
+		uint64_t curMin = make_bar_time(kp, _cur_date, _cur_time, _cur_secs / 1000);
 		if (isDay)
 		{
 			if (kBlkPair->_cursor <= kBlkPair->_count)
@@ -3303,7 +3338,7 @@ void HisDataReplayer::checkUnbars()
 		//还没有经过初始定位
 		WTSBarStruct bar;
 		bar.date = _cur_tdate;
-		bar.time = (_cur_date - 19900000) * 10000 + _cur_time;
+		bar.time = make_bar_time(kBlkPair->_period, _cur_date, _cur_time, _cur_secs / 1000);
 
 		auto it = std::lower_bound(kBlkPair->_bars.begin(), kBlkPair->_bars.end(), bar, [](const WTSBarStruct& a, const WTSBarStruct& b) {
 			return a.time < b.time;
@@ -3983,6 +4018,7 @@ bool HisDataReplayer::cacheIntegratedFutBarsFromBin(void* codeInfo, const std::s
 	{
 	case KP_Minute1: pname = "min1"; break;
 	case KP_Minute5: pname = "min5"; break;
+	case KP_Sec5: pname = "sec5"; break;
 	default: pname = "day"; break;
 	}
 
@@ -4089,8 +4125,19 @@ bool HisDataReplayer::cacheIntegratedFutBarsFromBin(void* codeInfo, const std::s
 			uint64_t sTime = _bd_mgr.getBoundaryTime(stdPID, leftDt, false, true);
 			uint64_t eTime = _bd_mgr.getBoundaryTime(stdPID, rightDt, false, false);
 
+			/*
+			 *	By 秒线主力拼接修复 @ 2026.09.30
+			 *	边界时间要和bar的时间戳同一编码, 否则lower_bound全部落空, 每段都被跳过
+			 *	分钟线bar为 (date-19900000)*10000+HHMM, 秒线bar为 yyyyMMddHHmmss
+			 *	getBoundaryTime返回 yyyyMMddHHMM, 秒线补上秒位即可
+			 */
+			bool isSec = (period == KP_Sec5);
+
 			sBar.date = leftDt;
-			sBar.time = ((uint32_t)(sTime / 10000) - 19900000) * 10000 + (uint32_t)(sTime % 10000);
+			if (isSec)
+				sBar.time = sTime * 100;
+			else
+				sBar.time = ((uint32_t)(sTime / 10000) - 19900000) * 10000 + (uint32_t)(sTime % 10000);
 
 			if (sBar.time < lastHotTime)	//如果边界时间小于主力的最后一根Bar的时间, 说明已经有交叉了, 则不需要再处理了
 			{
@@ -4099,7 +4146,10 @@ bool HisDataReplayer::cacheIntegratedFutBarsFromBin(void* codeInfo, const std::s
 			}
 
 			eBar.date = rightDt;
-			eBar.time = ((uint32_t)(eTime / 10000) - 19900000) * 10000 + (uint32_t)(eTime % 10000);
+			if (isSec)
+				eBar.time = eTime * 100 + 59;
+			else
+				eBar.time = ((uint32_t)(eTime / 10000) - 19900000) * 10000 + (uint32_t)(eTime % 10000);
 
 			if (eBar.time <= lastHotTime)	//右边界时间小于最后一条Hot时间, 说明全部交叉了, 没有再找的必要了
 				break;
@@ -4261,6 +4311,16 @@ bool HisDataReplayer::cacheIntegratedFutBarsFromBin(void* codeInfo, const std::s
 			delete tempAy;
 		}
 		barsSections.clear();
+	}
+	else
+	{
+		//一根都没取到时不能返回true, 否则上层拿着空缓存去重采样, 回放时会崩溃
+		WTSLogger::error("No back {} data of {} loaded", pname, stdCode);
+		if (bSubbed)
+			_bars_cache.erase(key);
+		else
+			_unbars_cache.erase(key);
+		return false;
 	}
 
 	WTSLogger::info("{} items of back {} data of {} cached", realCnt, pname, stdCode);
