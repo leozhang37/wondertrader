@@ -23,3 +23,6 @@ INCLUDE_DIRECTORIES(${INCS})
 LINK_DIRECTORIES(${LNKS})
 
 ADD_LIBRARY(WTSTools ${SRCS} ${HDRS})
+
+# WTSTools 依赖 WTSUtils(WTSCfgLoader 等)，声明后 CMake 会自动把 WTSUtils 排在 WTSTools 之后链接
+TARGET_LINK_LIBRARIES(WTSTools WTSUtils)
