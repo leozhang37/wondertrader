@@ -23,6 +23,45 @@
 #include "../WTSTools/WTSLogger.h"
 #include "../WTSTools/WTSDataFactory.h"
 
+/*
+ *	秒线bar时间为 yyyyMMddHHmmss, 分钟线为 (date-19900000)*10000+HHMM,
+ *	两者差5个数量级, 缓存游标和查询边界都要按周期编码, 不能混比
+ */
+
+//bar时间转缓存游标: 日线为日期, 分钟线为 yyyyMMddHHmm, 秒线为 yyyyMMddHHmmss
+static inline uint64_t bar_cache_time(WTSKlinePeriod period, uint32_t uDate, uint64_t uTime)
+{
+	if (period == KP_DAY)
+		return uDate;
+
+	if (period == KP_Sec5)
+		return uTime;
+
+	return 199000000000 + uTime;
+}
+
+//缓存游标转为reader的查询时间(yyyyMMddHHmm)
+static inline uint64_t cache_time_to_query(WTSKlinePeriod period, uint64_t cacheTime)
+{
+	return (period == KP_Sec5) ? cacheTime / 100 : cacheTime;
+}
+
+//当前时间, 与 bar_cache_time 同精度
+static inline uint64_t now_cache_time(WTSKlinePeriod period)
+{
+	uint64_t now = TimeUtils::getYYYYMMDDhhmmss();
+	return (period == KP_Sec5) ? now : now / 100;
+}
+
+//查询边界 yyyyMMddHHmm 转为与bar时间同编码的值, 秒线上界补到该分钟的第59秒
+static inline uint64_t make_bar_bound(WTSKlinePeriod period, uint32_t uDate, uint32_t hm, bool bUpper)
+{
+	if (period == KP_Sec5)
+		return TimeUtils::timeToSecBar(uDate, hm * 100 + (bUpper ? 59 : 0));
+
+	return (uint64_t)(uDate - 19900000) * 10000 + hm;
+}
+
 
 WTSDataFactory g_dataFact;
 
@@ -226,13 +265,7 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_range(const char* stdCode, WTSK
 				bars.erase(bars.begin() + bars.size() - 1, bars.end());
 			}
 
-			if (period == KP_DAY)
-				barCache._last_bartime = kData->date(-1);
-			else
-			{
-				uint64_t lasttime = kData->time(-1);
-				barCache._last_bartime = 199000000000 + lasttime;
-			}
+			barCache._last_bartime = bar_cache_time(period, kData->date(-1), kData->time(-1));
 
 			rawData->release();
 		}
@@ -244,16 +277,12 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_range(const char* stdCode, WTSK
 	else
 	{
 		//后面则增量更新
-		WTSKlineSlice* rawData = _reader->readKlineSliceByRange(stdCode, period, barCache._last_bartime, 0);
+		WTSKlineSlice* rawData = _reader->readKlineSliceByRange(stdCode, period, cache_time_to_query(period, barCache._last_bartime), 0);
 		if (rawData != NULL)
 		{
 			for(int32_t idx = 0; idx < rawData->size(); idx ++)
 			{
-				uint64_t barTime = 0;
-				if (period == KP_DAY)
-					barTime = rawData->at(0)->date;
-				else
-					barTime = 199000000000 + rawData->at(0)->time;
+				uint64_t barTime = bar_cache_time(period, rawData->at(idx)->date, rawData->at(idx)->time);
 				
 				//只有时间上次记录的最后一条时间，才可以用于更新K线
 				if(barTime <= barCache._last_bartime)
@@ -270,13 +299,7 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_range(const char* stdCode, WTSK
 				bars.erase(bars.begin() + bars.size() - 1, bars.end());
 			}
 
-			if (period == KP_DAY)
-				barCache._last_bartime = barCache._bars->date(-1);
-			else
-			{
-				uint64_t lasttime = barCache._bars->time(-1);
-				barCache._last_bartime = 199000000000 + lasttime;
-			}
+			barCache._last_bartime = bar_cache_time(period, barCache._bars->date(-1), barCache._bars->time(-1));
 			
 
 			rawData->release();
@@ -293,14 +316,17 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_range(const char* stdCode, WTSK
 
 	WTSBarStruct eBar;
 	eBar.date = rDate;
-	eBar.time = (rDate - 19900000) * 10000 + rTime;
+	eBar.time = make_bar_bound(period, rDate, rTime, true);
 
 	WTSBarStruct sBar;
 	sBar.date = lDate;
-	sBar.time = (lDate - 19900000) * 10000 + lTime;
+	sBar.time = make_bar_bound(period, lDate, lTime, false);
 
 	uint32_t eIdx, sIdx;
 	auto& bars = barCache._bars->getDataRef();
+	if (bars.empty())
+		return NULL;
+
 	auto eit = std::lower_bound(bars.begin(), bars.end(), eBar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b) {
 		if (isDay)
 			return a.date < b.date;
@@ -315,6 +341,10 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_range(const char* stdCode, WTSK
 	{
 		if ((isDay && eit->date > eBar.date) || (!isDay && eit->time > eBar.time))
 		{
+			//查询区间整体早于缓存数据, 再退就越界了
+			if (eit == bars.begin())
+				return NULL;
+
 			eit--;
 		}
 
@@ -365,10 +395,8 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 			//这里采用保守的方案，如果本地时间大于最后一条K线的时间，则认为真正闭合了
 			if (period != KP_DAY)
 			{
-				uint64_t last_bartime = 0;
-				last_bartime = 199000000000 + kData->time(-1);
-
-				uint64_t now = TimeUtils::getYYYYMMDDhhmmss() / 100;
+				uint64_t last_bartime = bar_cache_time(period, kData->date(-1), kData->time(-1));
+				uint64_t now = now_cache_time(period);
 				if (now <= last_bartime && barCache._bars->size() > 0)
 				{
 					auto& bars = barCache._bars->getDataRef();
@@ -377,13 +405,7 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 			}
 
 
-			if (period == KP_DAY)
-				barCache._last_bartime = kData->date(-1);
-			else
-			{
-				uint64_t lasttime = kData->time(-1);
-				barCache._last_bartime = 199000000000 + lasttime;
-			}
+			barCache._last_bartime = bar_cache_time(period, kData->date(-1), kData->time(-1));
 
 			rawData->release();
 		}
@@ -395,17 +417,13 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 	else
 	{
 		//后面则增量更新
-		WTSKlineSlice* rawData = _reader->readKlineSliceByRange(stdCode, period, barCache._last_bartime, 0);
+		WTSKlineSlice* rawData = _reader->readKlineSliceByRange(stdCode, period, cache_time_to_query(period, barCache._last_bartime), 0);
 		if (rawData != NULL)
 		{
 			WTSLogger::info("{} {} bars of {} updated, adding to cache...", rawData->size(), tag, stdCode);
 			for (int32_t idx = 0; idx < rawData->size(); idx++)
 			{
-				uint64_t barTime = 0;
-				if (period == KP_DAY)
-					barTime = rawData->at(0)->date;
-				else
-					barTime = 199000000000 + rawData->at(0)->time;
+				uint64_t barTime = bar_cache_time(period, rawData->at(idx)->date, rawData->at(idx)->time);
 
 				//只有时间上次记录的最后一条时间，才可以用于更新K线
 				if (barTime <= barCache._last_bartime)
@@ -418,10 +436,8 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 			//这里采用保守的方案，如果本地时间大于最后一条K线的时间，则认为真正闭合了
 			if (period != KP_DAY)
 			{
-				uint64_t last_bartime = 0;
-				last_bartime = 199000000000 + barCache._bars->time(-1);
-
-				uint64_t now = TimeUtils::getYYYYMMDDhhmmss() / 100;
+				uint64_t last_bartime = bar_cache_time(period, barCache._bars->date(-1), barCache._bars->time(-1));
+				uint64_t now = now_cache_time(period);
 				if (now <= last_bartime && barCache._bars->size() > 0)
 				{
 					auto& bars = barCache._bars->getDataRef();
@@ -429,13 +445,7 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 				}
 			}
 
-			if (period == KP_DAY)
-				barCache._last_bartime = barCache._bars->date(-1);
-			else
-			{
-				uint64_t lasttime = barCache._bars->time(-1);
-				barCache._last_bartime = 199000000000 + lasttime;
-			}
+			barCache._last_bartime = bar_cache_time(period, barCache._bars->date(-1), barCache._bars->time(-1));
 
 
 			rawData->release();
@@ -450,10 +460,13 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 
 	WTSBarStruct eBar;
 	eBar.date = rDate;
-	eBar.time = (rDate - 19900000) * 10000 + rTime;
+	eBar.time = make_bar_bound(period, rDate, rTime, true);
 
 	uint32_t eIdx, sIdx;
 	auto& bars = barCache._bars->getDataRef();
+	if (bars.empty())
+		return NULL;
+
 	auto eit = std::lower_bound(bars.begin(), bars.end(), eBar, [isDay](const WTSBarStruct& a, const WTSBarStruct& b) {
 		if (isDay)
 			return a.date < b.date;
@@ -468,6 +481,10 @@ WTSKlineSlice* WtDataManager::get_kline_slice_by_count(const char* stdCode, WTSK
 	{
 		if ((isDay && eit->date > eBar.date) || (!isDay && eit->time > eBar.time))
 		{
+			//查询区间整体早于缓存数据, 再退就越界了
+			if (eit == bars.begin())
+				return NULL;
+
 			eit--;
 		}
 

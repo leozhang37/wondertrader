@@ -1264,8 +1264,9 @@ bool WtRdmDtReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key,
 				uint64_t sTime = _base_data_mgr->getBoundaryTime(stdPID, leftDt, false, true);
 				uint64_t eTime = _base_data_mgr->getBoundaryTime(stdPID, rightDt, false, false);
 
+				//秒线bar时间为 yyyyMMddHHmmss, 边界必须按周期编码, 否则每段都定位不到数据
 				sBar.date = leftDt;
-				sBar.time = ((uint32_t)(sTime / 10000) - 19900000) * 10000 + (uint32_t)(sTime % 10000);
+				sBar.time = make_bar_bound(period, (uint32_t)(sTime / 10000), (uint32_t)(sTime % 10000), false);
 
 				if(sBar.time < lastHotTime)	//如果边界时间小于主力的最后一根Bar的时间, 说明已经有交叉了, 则不需要再处理了
 				{
@@ -1274,7 +1275,7 @@ bool WtRdmDtReader::cacheHisBarsFromFile(void* codeInfo, const std::string& key,
 				}
 
 				eBar.date = rightDt;
-				eBar.time = ((uint32_t)(eTime / 10000) - 19900000) * 10000 + (uint32_t)(eTime % 10000);
+				eBar.time = make_bar_bound(period, (uint32_t)(eTime / 10000), (uint32_t)(eTime % 10000), true);
 
 				if (eBar.time <= lastHotTime)	//右边界时间小于最后一条Hot时间, 说明全部交叉了, 没有再找的必要了
 					break;
